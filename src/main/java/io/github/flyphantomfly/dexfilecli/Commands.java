@@ -211,7 +211,7 @@ final class Commands {
 
     private static String defaultOut(String input, String suffix) {
         String stem = input;
-        for (String ext : new String[]{".apk", ".dex", ".vdex", ".cdex", ".jar"}) {
+        for (String ext : new String[]{".apk", ".dex", ".vdex", ".cdex", ".jar", ".smali"}) {
             if (stem.toLowerCase(Locale.ROOT).endsWith(ext)) {
                 stem = stem.substring(0, stem.length() - ext.length());
                 break;
