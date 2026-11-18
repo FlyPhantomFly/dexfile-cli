@@ -138,6 +138,11 @@ final class Commands {
     }
 
     private static DexVersion versionAt(byte[] data, int off) {
+        // fast reject: every dex/cdex magic starts with 'd' or 'c'
+        char first = (char) (data[off] & 0xFF);
+        if (first != 'd' && first != 'c') {
+            return null;
+        }
         for (DexVersion v : DexVersion.values()) {
             byte[] magic = v.getMagicArray();
             if (off + magic.length <= data.length) {
@@ -159,6 +164,15 @@ final class Commands {
 
     private static Dex cacheToDex(DexIO.DexReaderCache cache) {
         return Dex.of(cache.getClasses());
+    }
+
+    /** Containers carry multiple parts — model-level surgery needs a single dex. */
+    private static void requireSingleDex(ReadResult rr, String command) {
+        if (rr.cache == null || rr.dex == null) {
+            throw new UsageException(
+                    "the input is a dex 041 container (" + rr.detected + ") — " + command
+                    + " works on a single dex; run extract or convert first");
+        }
     }
 
     private static WriteOptions writeOptions(DexVersion target) {
@@ -430,6 +444,7 @@ final class Commands {
     static Map<String, Object> split(String input, String outDir, Integer apiOverride) {
         byte[] data = readFile(input);
         ReadResult rr = readAny(data, apiOverride);
+        requireSingleDex(rr, "split");
         String dir = outDir != null ? outDir : defaultOut(input, "_split");
         WriteOptions opts = writeOptions(parseVersion("035"));
         List<Dex> parts = DexIO.balanceAll(opts, rr.cache.getClasses());
@@ -483,6 +498,7 @@ final class Commands {
         }
 
         ReadResult rr = readAny(data, apiOverride);
+        requireSingleDex(rr, "patch");
         OpRewriter rewriter = new OpRewriter(ops);
         Dex patched = rewriter.rewriteDex(rr.dex);
 

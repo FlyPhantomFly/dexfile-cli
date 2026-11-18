@@ -84,15 +84,16 @@ public final class Main {
                 positional.add(args[i]);
             }
         }
-        Integer api = flags.containsKey("api") ? Integer.parseInt(flags.get("api")) : null;
+        Integer api = intFlag(flags, "api");
+        Integer limit = intFlag(flags, "limit");
 
         Map<String, Object> out;
         switch (cmd) {
             case "info" -> {
                 require(positional.size() == 1, "info needs exactly one input file");
                 boolean listClasses = flags.containsKey("classes");
-                int limit = flags.containsKey("limit") ? Integer.parseInt(flags.get("limit")) : 100;
-                out = Commands.info(positional.get(0), api, listClasses, limit);
+                int limitValue = limit != null ? limit : 100;
+                out = Commands.info(positional.get(0), api, listClasses, limitValue);
             }
             case "extract" -> {
                 require(positional.size() == 1, "extract needs exactly one input file");
@@ -130,6 +131,18 @@ public final class Main {
     private static void require(boolean ok, String message) {
         if (!ok) {
             throw new Commands.UsageException(message);
+        }
+    }
+
+    private static Integer intFlag(Map<String, String> flags, String key) {
+        String raw = flags.get(key);
+        if (raw == null || raw.equals("true")) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException e) {
+            throw new Commands.UsageException("--" + key + " expects an integer, got '" + raw + "'");
         }
     }
 
