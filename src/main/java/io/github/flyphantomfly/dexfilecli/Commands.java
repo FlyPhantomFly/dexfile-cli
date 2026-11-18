@@ -557,6 +557,50 @@ final class Commands {
                 "version", target.name());
     }
 
+    // ── outline ───────────────────────────────────────────────────────────
+
+    static Map<String, Object> outline(String input, String className, Integer apiOverride) {
+        byte[] data = readFile(input);
+        ReadResult rr = readAny(data, apiOverride, true);
+        requireSingleDex(rr, "outline");
+        for (ClassDef cls : rr.cache.getClasses()) {
+            if (cls.getType().getName().equals(className)) {
+                List<Object> fields = new ArrayList<>();
+                for (FieldDef f : cls.getFields()) {
+                    fields.add(Json.obj("name", f.getName(),
+                            "type", f.getType().getDescriptor(),
+                            "flags", com.v7878.dex.AccessFlag.formatAccessFlagsForField(f.getAccessFlags())));
+                }
+                List<Object> methods = new ArrayList<>();
+                for (MethodDef m : cls.getMethods()) {
+                    Integer registers = m.getImplementation() != null
+                            ? m.getImplementation().getRegisterCount() : null;
+                    methods.add(Json.obj("name", m.getName(),
+                            "descriptor", m.getProto().getDescriptor(),
+                            "flags", com.v7878.dex.AccessFlag.formatAccessFlagsForMethod(m.getAccessFlags()),
+                            "registers", registers));
+                }
+                List<Object> interfaces = new ArrayList<>();
+                for (TypeId it : cls.getInterfaces()) {
+                    interfaces.add(it.getName());
+                }
+                return Json.obj(
+                        "class", cls.getType().getName(),
+                        "descriptor", cls.getType().getDescriptor(),
+                        "super", cls.getSuperclass() != null ? cls.getSuperclass().getName() : null,
+                        "interfaces", interfaces,
+                        "access_flags", com.v7878.dex.AccessFlag.formatAccessFlagsForClass(cls.getAccessFlags()),
+                        "fields", fields,
+                        "field_count", fields.size(),
+                        "methods", methods,
+                        "method_count", methods.size(),
+                        "annotations_count", cls.getAnnotations().size(),
+                        "dex_version", rr.version.name());
+            }
+        }
+        throw new UsageException("class '" + className + "' not found in '" + input + "'");
+    }
+
     // ── split ─────────────────────────────────────────────────────────────
 
     static Map<String, Object> split(String input, String outDir, Integer apiOverride) {

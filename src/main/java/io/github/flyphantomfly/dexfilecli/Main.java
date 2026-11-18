@@ -113,6 +113,11 @@ public final class Main {
                 require(positional.size() == 1, "assemble needs exactly one smali file");
                 out = Commands.assemble(positional.get(0), flags.get("out"), api);
             }
+            case "outline" -> {
+                require(positional.size() == 1, "outline needs exactly one dex file");
+                require(flags.containsKey("class"), "outline needs --class <dotted class name>");
+                out = Commands.outline(positional.get(0), flags.get("class"), api);
+            }
             case "split" -> {
                 require(positional.size() == 1, "split needs exactly one dex file");
                 out = Commands.split(positional.get(0), flags.get("out"), api);
