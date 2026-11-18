@@ -61,7 +61,7 @@ java -jar build/libs/dexfile-cli.jar <subcommand> [options]
 | --- | --- |
 | `info <dex\|container\|vdex>` | version, target API, class/method/field/string counts; `--classes` adds a sorted class list (first 100, or `--limit N`) |
 | `extract <apk\|dex\|vdex>` | pull every `classes*.dex` into a directory (default `<input>_dex_extract`) |
-| `convert <in> --to 035…041` | read any supported version → write the target version (the old-ART vdex/cdex → plain dex bridge) |
+| `convert <in> --to 035…041` | read any supported version → write the target version (the old-ART vdex/cdex → plain dex bridge; for cdex/vdex-era content, 037 is the closest target — see limits) |
 | `patch <dex> --ops <ops.json>` | apply the ops described below |
 | `assemble <smali_file>` | one smali class → dex |
 | `split <dex>` | shard the class list across dex files under the 64K-reference limit; the balancer picks the part count |
@@ -114,6 +114,9 @@ Worth knowing:
   `field`. Making a method non-`NATIVE` and replacing its body is a common pair.
 * `replace-method-body` parses method-level smali (`SmaliIO.parseMethod`) — hidden-API flags
   survive the swap because the smali text can't express them.
+* On a cdex input, `patch` re-writes to DEX037, not 035 — cdex 001 is Android 9 (API 28)
+  era ART output, and 037 is the closest standard version to it. The JSON's
+  `version_from`/`version_to` always tell you what actually happened.
 * The result reports a `matched` count per op. `matched: 0` means the op found nothing —
   almost always a name typo.
 
@@ -130,7 +133,10 @@ Worth knowing:
   The vdex/cdex bridge applies to older ART output (embedded cdex, the Android 8–10 era)
   and standalone cdex from dalvik-cache.
 * cdex can only be *written* as a standalone file, which isn't loadable via
-  `PathClassLoader` on-device — treat it as a conversion/analysis artifact.
+  `PathClassLoader` on-device — treat it as a conversion/analysis artifact. When you do
+  write it out (or let `patch` rewrite a cdex in place), the CLI uses DEX037 as the target:
+  cdex 001 content is Android 9 (API 28) era, and 037 (API 26+) is the closest standard dex
+  version — dropping to 035 would mislabel it. Pass an explicit `--to` to override.
 * `patch` and `split` want a single dex; hand them a 041 container and they'll tell you to
   run `extract` or `convert` first.
 

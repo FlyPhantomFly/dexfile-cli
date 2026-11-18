@@ -503,7 +503,9 @@ final class Commands {
         Dex patched = rewriter.rewriteDex(rr.dex);
 
         DexVersion original = rr.version;
-        DexVersion target = original.isCompact() ? DexVersion.DEX035 : original;
+        // cdex 001 is Android 9 (API 28) era ART output — rewrite it to DEX037
+        // (API 26+, the closest standard version) rather than dropping to 035.
+        DexVersion target = original.isCompact() ? DexVersion.DEX037 : original;
         WriteOptions opts = writeOptions(target);
         String path = outPath != null ? outPath : input; // .bak is the Python side's job
         writeFile(path, DexIO.write(opts, patched));
