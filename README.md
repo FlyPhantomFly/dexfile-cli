@@ -134,9 +134,10 @@ Worth knowing:
   and standalone cdex from dalvik-cache.
 * cdex can only be *written* as a standalone file, which isn't loadable via
   `PathClassLoader` on-device — treat it as a conversion/analysis artifact. When you do
-  write it out (or let `patch` rewrite a cdex in place), the CLI uses DEX037 as the target:
-  cdex 001 content is Android 9 (API 28) era, and 037 (API 26+) is the closest standard dex
-  version — dropping to 035 would mislabel it. Pass an explicit `--to` to override.
+  write it out, DEX037 is the right target: cdex 001 content is Android 9 (API 28) era, and
+  037 (API 26+) is the closest standard dex version — dropping to 035 would mislabel it.
+  `patch` already rewrites cdex to 037 by default; for `convert`, pass `--to 037` (the
+  subcommand table's bridge note is the recommendation, not a default).
 * `patch` and `split` want a single dex; hand them a 041 container and they'll tell you to
   run `extract` or `convert` first.
 
