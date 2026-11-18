@@ -29,7 +29,7 @@ adds the command-line shell around them.
 | --- | --- | --- |
 | Shape | Java library (`com.v7878.dex.*`) — you write Java/Kotlin against its API | Runnable CLI — six subcommands, no code to write |
 | Output | In-process objects you consume however you like | One JSON object per run on stdout, logs on stderr, fixed exit codes |
-| Reading | Reads whatever you point it at: flat dex, containers, cdex | Same, plus a magic-scan fallback that hunts for dex/cdex magics anywhere in the file (vdex-era cdex, packer-shuffled dex) and an API ladder (34 → 28 → 21 → 19 → min) that retries the read under different target-API interpretations |
+| Reading | Reads whatever you point it at: flat dex, containers, cdex | Same, plus a magic-scan fallback that hunts for dex/cdex magics anywhere in the file (vdex-era cdex, packer-shuffled dex, dey-embedded dex) and an API ladder (34 → 28 → 21 → 19 → min; pre-release 009/013 pinned to their era) that retries each rung plain and odex-enabled |
 | APKs | — | `extract` walks a zip and pulls out every `classes*.dex` (041 containers get split into parts) |
 | Patching | Full rewriter API (`DexRewriter`) | `patch` drives that rewriter for you from a JSON ops file — no rewriter boilerplate |
 | Smali | `SmaliIO` API | `assemble`: one smali text file → dex |
@@ -59,9 +59,9 @@ java -jar build/libs/dexfile-cli.jar <subcommand> [options]
 
 | Subcommand | What it does |
 | --- | --- |
-| `info <dex\|container\|vdex>` | version, target API, class/method/field/string counts; `--classes` adds a sorted class list (first 100, or `--limit N`) |
+| `info <dex\|container\|vdex>` | version, target API, class/method/field/string counts; `--classes` adds a sorted class list (first 100, or `--limit N`) — and switches to a full-model read, see below |
 | `extract <apk\|dex\|vdex>` | pull every `classes*.dex` into a directory (default `<input>_dex_extract`) |
-| `convert <in> --to 035…041` | read any supported version → write the target version (the old-ART vdex/cdex → plain dex bridge; for cdex/vdex-era content, 037 is the closest target — see limits) |
+| `convert <in> --to 035…041` | read any supported version → write the target version (for cdex/vdex-era content, 037 is the closest target — see limits) |
 | `patch <dex> --ops <ops.json>` | apply the ops described below |
 | `assemble <smali_file>` | one smali class → dex |
 | `split <dex>` | shard the class list across dex files under the 64K-reference limit; the balancer picks the part count |
@@ -71,11 +71,18 @@ Options:
 * `--out PATH` — where to write. Defaults are sensible-ish (`app.vdex` → `app.035.dex`,
   directories `<input>_dex_extract` and `<input>_split`), but note that **`patch` overwrites
   its input file when you omit `--out`** — pass `--out` or keep a copy.
-* `--api N` — pin the target-API interpretation. The reader normally climbs an API ladder
-  (34, 28, 21, 19, then the version's minimum) and keeps the first reading that works, which
-  matters because odex/hidden-api handling changes with API level. You'll see it in output:
-  a plain 035 file can report `target_api: 34` because that interpretation read it first.
-  Pin it with `--api` if you want a specific one.
+* `--api N` — pin the target-API interpretation. Without it, the reader climbs an API
+  ladder (34, 28, 21, 19, then the version's minimum; the pre-release dexes 009/013 pin
+  exactly their own era api) and at each rung first tries a plain reading, then one with
+  odex instructions enabled. You'll see which interpretation won in the output:
+  `target_api` plus a `detected` value like `wrapped@30+odex`. A plain 035 file reports
+  `target_api: 34` because that interpretation read it first; a quickened real-ART cdex
+  falls through to api 28 with odex on (that's where legacy hidden-API bits packed into
+  field flags decrypt). Pin it with `--api` if you want a specific one.
+* Plain `info` walks only the section tables — fast, but it can't catch content that only
+  fails at full materialization (those quickened opcodes, packed field flags).
+  `info --classes`, `convert`, `patch` and `split` force the full model, so their ladder
+  answer is the one that actually survives touching every class.
 
 Exit codes: `0` ok, `1` unexpected error, `2` usage, `3` not-a-dex (no readable dex magic),
 `4` invalid-dex (magic found, file broken). Errors also land as JSON on stdout, e.g.
@@ -128,10 +135,24 @@ Worth knowing:
   decompile the result before you trust it).
 * Round-trips re-serialize: the semantic content survives, the byte layout does not. Don't
   rely on offsets or expect byte-identical output.
-* vdex from modern ART (v27+ containers, Android 13+) carries **no embedded dex** — the dex
-  lives in the APK. The magic-scan path honestly reports "no readable dex magic" for those.
-  The vdex/cdex bridge applies to older ART output (embedded cdex, the Android 8–10 era)
-  and standalone cdex from dalvik-cache.
+* **Real-ART cdex reads but doesn't convert.** Verified against a 19 MB Android-12 boot
+  vdex (vdex 019, three embedded cdex parts, 13,754 framework classes): the magic scan
+  finds the parts, counts them, lists their classes — full materialization lands on the
+  api-28-with-odex interpretation, where legacy hidden-API bits packed into field flags
+  decrypt. But those parts are *quickened* (~330k odex instructions:
+  `invoke-virtual-quick`, `iget/iput-quick`, `return-void-no-barrier`), and writing a
+  faithful standard dex out of them needs de-odexing — resolving those optimized opcodes
+  back to plain references — which current DexFile does not do. `info` and `extract`
+  work; `convert`/`patch`/`split` fail honestly, naming the first offending opcode.
+  Synthetic/plain cdex (e.g. dalvik-cache files without quickening) still converts fine.
+* The same odex wall applies to the pre-release dexes: dex 009 (M3) and 013 (M5) — flat
+  or embedded in their dey odex wrappers — now *read* (verified against real HTC Sooner
+  framework files: 2,412 and 2,910 classes; the wrapper's embedded dex sits at offset 40
+  and the scan finds it), but their era's optimized opcodes (`M_INVOKE_DIRECT`, …) block
+  writing a standard version. Upstream marks 009/013 write support "planned" anyway.
+* vdex from the newest ART (v27+ containers, Android 13+) carries **no embedded dex** —
+  the dex lives in the APK. The magic scan honestly reports "no readable dex magic" for
+  those. Everything older that embeds cdex or dex parts reads (see above).
 * cdex can only be *written* as a standalone file, which isn't loadable via
   `PathClassLoader` on-device — treat it as a conversion/analysis artifact. When you do
   write it out, DEX037 is the right target: cdex 001 content is Android 9 (API 28) era, and

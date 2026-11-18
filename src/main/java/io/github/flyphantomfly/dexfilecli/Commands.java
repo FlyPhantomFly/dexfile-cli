@@ -56,7 +56,10 @@ final class Commands {
 
     private static ReadOptions readOptions(DexVersion version, Integer apiOverride) {
         int api = apiOverride != null ? apiOverride : version.getMinApi();
-        return ReadOptions.defaultOptions().withTargetApi(api);
+        // defaultOptions() carries art=true and withTargetApi() keeps that flag — a
+        // dalvik-era api (<= 20, incl. the 009/013 milestones) must flip it back or
+        // DexOptions.validate() rejects the combination outright
+        return ReadOptions.defaultOptions().withTargetApi(api).withTargetForArt(api > 20);
     }
 
     /**
@@ -70,6 +73,10 @@ final class Commands {
             return new int[]{apiOverride};
         }
         int min = version.getMinApi();
+        if (min < 1) {
+            // pre-release milestones (dex009 = M3, dex013 = M5) accept exactly their own api
+            return new int[]{min};
+        }
         if (min >= 34) {
             return new int[]{min};
         }
@@ -87,17 +94,43 @@ final class Commands {
         return arr;
     }
 
-    private static DexIO.DexReaderCache tryReadCache(byte[] data, DexVersion version,
-                                                     int headerOffset, int contentOffset, Integer apiOverride) {
-        var opts = readOptions(version, apiOverride);
+    /**
+     * One (offset, api, odex) interpretation. Deep reads force full class
+     * materialization — lazily-computed caches otherwise pass the header checks
+     * and blow up later on real-ART cdex (legacy hidden-API bits packed into
+     * field flags, quickened odex opcodes). Null = interpretation doesn't work.
+     */
+    private static ReadResult tryRead(byte[] data, DexVersion version, int dataOffset,
+                                      int contentOffset, int api, boolean odex, boolean deep) {
+        var opts = readOptions(version, api);
+        if (odex) {
+            opts = opts.withOdexInstructions(true);
+        }
+        DexIO.DexReaderCache cache;
         try {
-            return DexIO.readCache(opts, data, 0, headerOffset, contentOffset);
+            // embedded dexes are read by slicing the buffer at the magic (data_offset)
+            // — DexReader rejects a non-zero header_offset for anything but containers
+            cache = DexIO.readCache(opts, data, dataOffset, 0, contentOffset);
         } catch (RuntimeException ignored) {
             return null;
         }
+        if (deep) {
+            try {
+                for (ClassDef cls : cache.getClasses()) {
+                    cls.getFields();
+                    cls.getMethods();
+                }
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+        String how = (dataOffset == 0 ? "flat" : "wrapped@" + Integer.toHexString(dataOffset))
+                + (odex ? "+odex" : "")
+                + (contentOffset != 0 ? "/content@" + Integer.toHexString(contentOffset) : "");
+        return new ReadResult(cache, cacheToDex(cache), version, how, dataOffset, api);
     }
 
-    private static ReadResult readAny(byte[] data, Integer apiOverride) {
+    private static ReadResult readAny(byte[] data, Integer apiOverride, boolean deep) {
         DexVersion atZero = versionAt(data, 0);
         if (atZero != null && atZero.isDexContainer()) {
             Dex[] parts = DexIO.readDexContainer(readOptions(atZero, apiOverride), data, 0);
@@ -105,9 +138,11 @@ final class Commands {
         }
         if (atZero != null) {
             for (int api : apiLadder(atZero, apiOverride)) {
-                var cache = tryReadCache(data, atZero, 0, 0, api);
-                if (cache != null) {
-                    return new ReadResult(cache, cacheToDex(cache), atZero, "flat", 0, api);
+                for (boolean odex : new boolean[]{false, true}) {
+                    ReadResult rr = tryRead(data, atZero, 0, 0, api, odex, deep);
+                    if (rr != null) {
+                        return rr;
+                    }
                 }
             }
             throw new DexIO.NotADexFile(
@@ -121,18 +156,28 @@ final class Commands {
                 candidates.add(off);
             }
         }
+        List<String> found = new ArrayList<>();
         for (int off : candidates) {
             DexVersion v = versionAt(data, off);
+            if (found.size() < 8) {
+                found.add(v.name() + "@" + Integer.toHexString(off));
+            }
             for (int api : apiLadder(v, apiOverride)) {
-                for (int contentOffset : new int[]{0, off}) {
-                    var cache = tryReadCache(data, v, off, contentOffset, api);
-                    if (cache != null) {
-                        String how = "wrapped@" + Integer.toHexString(off)
-                                + (contentOffset != 0 ? "/content@" + Integer.toHexString(contentOffset) : "");
-                        return new ReadResult(cache, cacheToDex(cache), v, how, off, api);
+                for (boolean odex : new boolean[]{false, true}) {
+                    for (int contentOffset : new int[]{0, off}) {
+                        ReadResult rr = tryRead(data, v, off, contentOffset, api, odex, deep);
+                        if (rr != null) {
+                            return rr;
+                        }
                     }
                 }
             }
+        }
+        if (!found.isEmpty()) {
+            String shown = String.join(", ", found.subList(0, Math.min(3, found.size())))
+                    + (found.size() > 3 ? " +" + (found.size() - 3) + " more" : "");
+            throw new DexIO.NotADexFile("dex magic found (" + shown + ") but no API interpretation "
+                    + "reads it — a format variant beyond current DexFile support; see README limits");
         }
         throw new DexIO.NotADexFile("no readable dex magic found (flat, container, or wrapped)");
     }
@@ -163,7 +208,9 @@ final class Commands {
 
 
     private static Dex cacheToDex(DexIO.DexReaderCache cache) {
-        return Dex.of(cache.getClasses());
+        // Dex.of() re-validates access flags and rejects real-world quirks (e.g. fields
+        // carrying the 0x20 bit inside vdex-era cdex); Dex.raw() trusts the reader
+        return Dex.raw(cache.getClasses());
     }
 
     /** Containers carry multiple parts — model-level surgery needs a single dex. */
@@ -205,6 +252,32 @@ final class Commands {
         }
     }
 
+    /**
+     * Write a full dex, mapping the odex-constraint failure to an honest error:
+     * odex-bearing inputs (real-ART quickened cdex, M3/M5-era optimized dex)
+     * cannot re-serialize into a standard version — resolving the optimized
+     * opcodes back to references is de-odexing, which current DexFile does
+     * not do.
+     */
+    private static void writeDex(String path, WriteOptions opts, Dex dex) {
+        byte[] out;
+        try {
+            out = DexIO.write(opts, dex);
+        } catch (IllegalArgumentException e) {
+            String msg = String.valueOf(e.getMessage());
+            if (msg.contains("Constraints for opcode")) {
+                String op = msg.substring(msg.indexOf("opcode ") + 7);
+                op = op.substring(0, op.contains(" ") ? op.indexOf(' ') : op.length());
+                throw new DexIO.InvalidDexFile("the dex contains odex-only instructions (first: "
+                        + op + ") — a faithful standard write needs de-odexing (resolving optimized "
+                        + "opcodes back to plain references), which current DexFile does not do; "
+                        + "info and extract still work on this file");
+            }
+            throw e;
+        }
+        writeFile(path, out);
+    }
+
     private static boolean isZip(byte[] data) {
         return data.length > 4 && data[0] == 'P' && data[1] == 'K' && data[2] == 3 && data[3] == 4;
     }
@@ -234,7 +307,7 @@ final class Commands {
             return Json.obj("file", file, "container", true, "version", atZero.name(),
                     "parts", infos, "part_count", parts.length);
         }
-        ReadResult rr = readAny(data, apiOverride);
+        ReadResult rr = readAny(data, apiOverride, listClasses);
         Map<String, Object> out = dexInfo(rr);
         out.put("file", file);
         if (listClasses) {
@@ -340,7 +413,8 @@ final class Commands {
         writeFile(path, data);
         Map<String, Object> info;
         try {
-            ReadResult rr = readAny(data, apiOverride);
+            // shallow read: extract only needs the section counts for its report
+            ReadResult rr = readAny(data, apiOverride, false);
             info = Json.obj("version", rr.version.name(), "classes", rr.cache.getClasses().size());
         } catch (RuntimeException e) {
             info = Json.obj("version", "unreadable", "error", String.valueOf(e.getMessage()));
@@ -388,9 +462,9 @@ final class Commands {
                         "classes", parts[i].getClasses().size()));
             }
         } else {
-            ReadResult rr = readAny(data, apiOverride);
+            ReadResult rr = readAny(data, apiOverride, true);
             String path = outPath != null ? outPath : defaultOut(input, "." + shortVer(target) + ".dex");
-            writeFile(path, DexIO.write(writeOptions(target), rr.dex));
+            writeDex(path, writeOptions(target), rr.dex);
             converted.add(Json.obj("path", path, "from", rr.version.name(), "to", target.name(),
                     "classes", rr.cache.getClasses().size(), "detected", rr.detected));
         }
@@ -443,7 +517,7 @@ final class Commands {
 
     static Map<String, Object> split(String input, String outDir, Integer apiOverride) {
         byte[] data = readFile(input);
-        ReadResult rr = readAny(data, apiOverride);
+        ReadResult rr = readAny(data, apiOverride, true);
         requireSingleDex(rr, "split");
         String dir = outDir != null ? outDir : defaultOut(input, "_split");
         WriteOptions opts = writeOptions(parseVersion("035"));
@@ -455,7 +529,7 @@ final class Commands {
         List<Object> written = new ArrayList<>();
         for (int i = 0; i < parts.size(); i++) {
             String path = Path.of(dir, stem + ".part" + i + ".dex").toString();
-            writeFile(path, DexIO.write(opts, parts.get(i)));
+            writeDex(path, opts, parts.get(i));
             written.add(Json.obj("path", path, "classes", parts.get(i).getClasses().size()));
         }
         return Json.obj("input", input, "out_dir", dir, "total_classes", rr.cache.getClasses().size(),
@@ -497,7 +571,7 @@ final class Commands {
             throw new UsageException("ops list is empty");
         }
 
-        ReadResult rr = readAny(data, apiOverride);
+        ReadResult rr = readAny(data, apiOverride, true);
         requireSingleDex(rr, "patch");
         OpRewriter rewriter = new OpRewriter(ops);
         Dex patched = rewriter.rewriteDex(rr.dex);
@@ -508,7 +582,7 @@ final class Commands {
         DexVersion target = original.isCompact() ? DexVersion.DEX037 : original;
         WriteOptions opts = writeOptions(target);
         String path = outPath != null ? outPath : input; // .bak is the Python side's job
-        writeFile(path, DexIO.write(opts, patched));
+        writeDex(path, opts, patched);
 
         List<Object> opResults = new ArrayList<>();
         for (Map<String, Object> op : ops) {
