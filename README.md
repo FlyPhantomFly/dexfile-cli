@@ -29,7 +29,7 @@ adds the command-line shell around them.
 | --- | --- | --- |
 | Shape | Java library (`com.v7878.dex.*`) — you write Java/Kotlin against its API | Runnable CLI — six subcommands, no code to write |
 | Output | In-process objects you consume however you like | One JSON object per run on stdout, logs on stderr, fixed exit codes |
-| Reading | Reads whatever you point it at: flat dex, containers, cdex | Same, plus a magic-scan fallback that hunts for dex/cdex magics anywhere in the file (vdex-era cdex, packer-shuffled dex, dey-embedded dex) and an API ladder (34 → 28 → 21 → 19 → min; pre-release 009/013 pinned to their era) that retries each rung plain and odex-enabled |
+| Reading | Reads whatever you point it at: flat dex, containers, cdex | Same, plus a magic-scan fallback that hunts for dex/cdex magics anywhere in the file (vdex-era cdex, packer-shuffled dex, dey-embedded dex) and an API ladder (34 → 28 → 21 → 19 → min; pre-release 009/013 pinned to their era) that retries the read under different target-API interpretations, odex instructions always enabled |
 | APKs | — | `extract` walks a zip and pulls out every `classes*.dex` (041 containers get split into parts) |
 | Patching | Full rewriter API (`DexRewriter`) | `patch` drives that rewriter for you from a JSON ops file — no rewriter boilerplate |
 | Smali | `SmaliIO` API | `assemble`: one smali text file → dex |
@@ -73,12 +73,14 @@ Options:
   its input file when you omit `--out`** — pass `--out` or keep a copy.
 * `--api N` — pin the target-API interpretation. Without it, the reader climbs an API
   ladder (34, 28, 21, 19, then the version's minimum; the pre-release dexes 009/013 pin
-  exactly their own era api) and at each rung first tries a plain reading, then one with
-  odex instructions enabled. You'll see which interpretation won in the output:
-  `target_api` plus a `detected` value like `wrapped@30+odex`. A plain 035 file reports
-  `target_api: 34` because that interpretation read it first; a quickened real-ART cdex
-  falls through to api 28 with odex on (that's where legacy hidden-API bits packed into
-  field flags decrypt). Pin it with `--api` if you want a specific one.
+  exactly their own era api). Odex instructions are always enabled on reads and writes:
+  the runtime accepts every opcode it supports regardless of the dex version carrying it.
+  (APIs 19 and 20 shipped both Dalvik and ART — the library accepts either `art` setting
+  there; this CLI reads them as dalvik-era.) You'll see which interpretation won in the
+  output: `target_api` plus a `detected` value like `wrapped@30`. A plain 035 file reports
+  `target_api: 34` because that interpretation read it first; a real-ART cdex with legacy
+  hidden-API bits packed into field flags falls through to api 28, where they decrypt.
+  Pin it with `--api` if you want a specific one.
 * Plain `info` walks only the section tables — fast, but it can't catch content that only
   fails at full materialization (those quickened opcodes, packed field flags).
   `info --classes`, `convert`, `patch` and `split` force the full model, so their ladder
@@ -121,9 +123,10 @@ Worth knowing:
   `field`. Making a method non-`NATIVE` and replacing its body is a common pair.
 * `replace-method-body` parses method-level smali (`SmaliIO.parseMethod`) — hidden-API flags
   survive the swap because the smali text can't express them.
-* On a cdex input, `patch` re-writes to DEX037, not 035 — cdex 001 is Android 9 (API 28)
-  era ART output, and 037 is the closest standard version to it. The JSON's
-  `version_from`/`version_to` always tell you what actually happened.
+* On a cdex input, `patch` re-writes to DEX037, not 035 — cdex doesn't record the dex
+  version it was converted from (just a one-bit flags field: 0 = the source was a 035,
+  1 = later), and dex037 (introduced in API 24) covers the cdex era with room to spare.
+  The JSON's `version_from`/`version_to` always tell you what actually happened.
 * The result reports a `matched` count per op. `matched: 0` means the op found nothing —
   almost always a name typo.
 
@@ -135,30 +138,39 @@ Worth knowing:
   decompile the result before you trust it).
 * Round-trips re-serialize: the semantic content survives, the byte layout does not. Don't
   rely on offsets or expect byte-identical output.
-* **Real-ART cdex reads but doesn't convert.** Verified against a 19 MB Android-12 boot
-  vdex (vdex 019, three embedded cdex parts, 13,754 framework classes): the magic scan
-  finds the parts, counts them, lists their classes — full materialization lands on the
-  api-28-with-odex interpretation, where legacy hidden-API bits packed into field flags
-  decrypt. But those parts are *quickened* (~330k odex instructions:
-  `invoke-virtual-quick`, `iget/iput-quick`, `return-void-no-barrier`), and writing a
-  faithful standard dex out of them needs de-odexing — resolving those optimized opcodes
-  back to plain references — which current DexFile does not do. `info` and `extract`
-  work; `convert`/`patch`/`split` fail honestly, naming the first offending opcode.
-  Synthetic/plain cdex (e.g. dalvik-cache files without quickening) still converts fine.
-* The same odex wall applies to the pre-release dexes: dex 009 (M3) and 013 (M5) — flat
-  or embedded in their dey odex wrappers — now *read* (verified against real HTC Sooner
-  framework files: 2,412 and 2,910 classes; the wrapper's embedded dex sits at offset 40
-  and the scan finds it), but their era's optimized opcodes (`M_INVOKE_DIRECT`, …) block
-  writing a standard version. Upstream marks 009/013 write support "planned" anyway.
+* **Quickened odex opcodes are written verbatim, and that's fine on-device.** The runtime
+  accepts every instruction it supports regardless of the dex version carrying it, so
+  `convert`/`patch`/`split` write odex opcodes (odex instructions are enabled on every
+  write) instead of refusing. Verified against a 19 MB Android-12 boot vdex (vdex 019,
+  three embedded cdex parts, 13,754 framework classes, ~330k odex instructions): reading
+  lands on the api-28 interpretation where legacy hidden-API bits packed into field flags
+  decrypt, and `convert --to 037` produces a dex that reads back with the same class
+  count. The results report an `odex_instructions` count and a note — quickened references
+  (`invoke-virtual-quick`, `iget/iput-quick`) carry raw vtable/field offsets, so analysis
+  tools can only show them as unresolved (baksmali 3 annotates them as comments; the
+  DexFile dev branch ships a smali printer that handles odex/legacy/expanded opcodes
+  natively).
+* **Legacy ≠ odex.** The m-prefixed instructions in dex 009/013 are the standard
+  *legacy* set of their era, not odex — the library's `LegacyRewriter` converts them to
+  the modern format, and the CLI applies it automatically before any write. Verified
+  against real HTC Sooner framework files: flat dex009 (2,412 classes) and dex013 (2,910)
+  convert to 037 and baksmali decompiles every class; the dey odex wrappers carry genuine
+  dalvik-era odex opcodes on top (e.g. `invoke-direct-empty`, encodable only at api ≤ 13),
+  so those want a dalvik-era target — `--to 035` converts them (82,959 odex instructions
+  written verbatim), while `--to 037` refuses honestly, naming the opcode and suggesting
+  the right target range.
 * vdex from the newest ART (v27+ containers, Android 13+) carries **no embedded dex** —
   the dex lives in the APK. The magic scan honestly reports "no readable dex magic" for
   those. Everything older that embeds cdex or dex parts reads (see above).
 * cdex can only be *written* as a standalone file, which isn't loadable via
-  `PathClassLoader` on-device — treat it as a conversion/analysis artifact. When you do
-  write it out, DEX037 is the right target: cdex 001 content is Android 9 (API 28) era, and
-  037 (API 26+) is the closest standard dex version — dropping to 035 would mislabel it.
-  `patch` already rewrites cdex to 037 by default; for `convert`, pass `--to 037` (the
-  subcommand table's bridge note is the recommendation, not a default).
+  `PathClassLoader` on-device — treat it as a conversion/analysis artifact. For standard
+  targets, DEX037 (introduced in API 24) is the right landing for cdex-era content: cdex
+  doesn't record the dex version it was converted from — just a one-bit flags field
+  (0 = the source was a DEX035, 1 = later) — and the difference is verification
+  semantics, not opcodes: DEX035 forbids default methods in interfaces and doesn't
+  require classes in topological order (super before sub — cycles are even representable,
+  though unloadable), while 037+ enforces the order. `patch` rewrites cdex to 037 by
+  default; for `convert`, pass `--to 037`.
 * `patch` and `split` want a single dex; hand them a 041 container and they'll tell you to
   run `extract` or `convert` first.
 

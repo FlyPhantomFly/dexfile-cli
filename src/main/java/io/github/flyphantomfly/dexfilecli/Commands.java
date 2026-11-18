@@ -11,8 +11,11 @@ import com.v7878.dex.immutable.FieldDef;
 import com.v7878.dex.immutable.FieldId;
 import com.v7878.dex.immutable.MethodDef;
 import com.v7878.dex.immutable.MethodId;
+import com.v7878.dex.immutable.MethodImplementation;
 import com.v7878.dex.immutable.TypeId;
+import com.v7878.dex.immutable.bytecode.Instruction;
 import com.v7878.dex.rewriter.DexRewriter;
+import com.v7878.dex.rewriter.LegacyRewriter;
 import com.v7878.dex.smali.SmaliIO;
 
 import java.io.IOException;
@@ -56,10 +59,15 @@ final class Commands {
 
     private static ReadOptions readOptions(DexVersion version, Integer apiOverride) {
         int api = apiOverride != null ? apiOverride : version.getMinApi();
-        // defaultOptions() carries art=true and withTargetApi() keeps that flag — a
-        // dalvik-era api (<= 20, incl. the 009/013 milestones) must flip it back or
-        // DexOptions.validate() rejects the combination outright
-        return ReadOptions.defaultOptions().withTargetApi(api).withTargetForArt(api > 20);
+        // odex instructions are always enabled: the runtime accepts every opcode it
+        // supports regardless of the dex version carrying it (vova7878's guidance),
+        // and the art flag must follow the api — defaultOptions() carries art=true
+        // and withTargetApi() keeps it. The library accepts art from api 19
+        // (FIRST_ART_TARGET) and dalvik up to api 20 (LAST_DALVIK_TARGET) —
+        // levels 19 and 20 shipped both runtimes; we read them as dalvik-era.
+        return ReadOptions.defaultOptions().withTargetApi(api)
+                .withTargetForArt(api > 20)
+                .withOdexInstructions(true);
     }
 
     /**
@@ -95,22 +103,19 @@ final class Commands {
     }
 
     /**
-     * One (offset, api, odex) interpretation. Deep reads force full class
-     * materialization — lazily-computed caches otherwise pass the header checks
-     * and blow up later on real-ART cdex (legacy hidden-API bits packed into
-     * field flags, quickened odex opcodes). Null = interpretation doesn't work.
+     * One (offset, api) interpretation — odex instructions are always enabled
+     * (see readOptions). Deep reads force full class materialization —
+     * lazily-computed caches otherwise pass the header checks and blow up later
+     * on real-ART cdex (legacy hidden-API bits packed into field flags,
+     * quickened odex opcodes). Null = interpretation doesn't work.
      */
     private static ReadResult tryRead(byte[] data, DexVersion version, int dataOffset,
-                                      int contentOffset, int api, boolean odex, boolean deep) {
-        var opts = readOptions(version, api);
-        if (odex) {
-            opts = opts.withOdexInstructions(true);
-        }
+                                      int contentOffset, int api, boolean deep) {
         DexIO.DexReaderCache cache;
         try {
             // embedded dexes are read by slicing the buffer at the magic (data_offset)
             // — DexReader rejects a non-zero header_offset for anything but containers
-            cache = DexIO.readCache(opts, data, dataOffset, 0, contentOffset);
+            cache = DexIO.readCache(readOptions(version, api), data, dataOffset, 0, contentOffset);
         } catch (RuntimeException ignored) {
             return null;
         }
@@ -125,7 +130,6 @@ final class Commands {
             }
         }
         String how = (dataOffset == 0 ? "flat" : "wrapped@" + Integer.toHexString(dataOffset))
-                + (odex ? "+odex" : "")
                 + (contentOffset != 0 ? "/content@" + Integer.toHexString(contentOffset) : "");
         return new ReadResult(cache, cacheToDex(cache), version, how, dataOffset, api);
     }
@@ -138,11 +142,9 @@ final class Commands {
         }
         if (atZero != null) {
             for (int api : apiLadder(atZero, apiOverride)) {
-                for (boolean odex : new boolean[]{false, true}) {
-                    ReadResult rr = tryRead(data, atZero, 0, 0, api, odex, deep);
-                    if (rr != null) {
-                        return rr;
-                    }
+                ReadResult rr = tryRead(data, atZero, 0, 0, api, deep);
+                if (rr != null) {
+                    return rr;
                 }
             }
             throw new DexIO.NotADexFile(
@@ -163,12 +165,10 @@ final class Commands {
                 found.add(v.name() + "@" + Integer.toHexString(off));
             }
             for (int api : apiLadder(v, apiOverride)) {
-                for (boolean odex : new boolean[]{false, true}) {
-                    for (int contentOffset : new int[]{0, off}) {
-                        ReadResult rr = tryRead(data, v, off, contentOffset, api, odex, deep);
-                        if (rr != null) {
-                            return rr;
-                        }
+                for (int contentOffset : new int[]{0, off}) {
+                    ReadResult rr = tryRead(data, v, off, contentOffset, api, deep);
+                    if (rr != null) {
+                        return rr;
                     }
                 }
             }
@@ -226,10 +226,13 @@ final class Commands {
         int api = target.getMinApi();
         // DexOptions derives art = api > LAST_DALVIK_TARGET (20), but withers
         // keep the CURRENT art flag — set it explicitly to stay consistent.
+        // odex instructions are written verbatim: the runtime accepts them in any
+        // dex version it supports (23 <= api <= 30 covers the quickened set).
         return WriteOptions.defaultOptions()
                 .withDexVersion(target)
                 .withTargetApi(api)
-                .withTargetForArt(api > 20);
+                .withTargetForArt(api > 20)
+                .withOdexInstructions(true);
     }
 
     private static byte[] readFile(String path) {
@@ -253,11 +256,46 @@ final class Commands {
     }
 
     /**
-     * Write a full dex, mapping the odex-constraint failure to an honest error:
-     * odex-bearing inputs (real-ART quickened cdex, M3/M5-era optimized dex)
-     * cannot re-serialize into a standard version — resolving the optimized
-     * opcodes back to references is de-odexing, which current DexFile does
-     * not do.
+     * 009/013 models carry the era's *legacy* instruction set (the m-prefixed
+     * opcodes — standard for their day, not odex); the library's LegacyRewriter
+     * converts them to the modern set so a standard write works.
+     */
+    private static Dex toModernIfNeeded(DexVersion version, Dex dex) {
+        if (version != DexVersion.DEX009 && version != DexVersion.DEX013) {
+            return dex;
+        }
+        return new LegacyRewriter().rewriteDex(dex);
+    }
+
+    /** Odex (runtime-quickened) instruction count — reported when written verbatim. */
+    private static int countOdexInstructions(Dex dex) {
+        int count = 0;
+        for (ClassDef cls : dex.getClasses()) {
+            for (MethodDef m : cls.getMethods()) {
+                MethodImplementation impl = m.getImplementation();
+                if (impl == null) {
+                    continue;
+                }
+                for (Instruction ins : impl.getInstructions()) {
+                    if (ins.getOpcode().odexOnly()) {
+                        count++;
+                    }
+                }
+            }
+        }
+        return count;
+    }
+
+    private static final String ODEX_NOTE =
+            "odex opcodes are written verbatim — the on-device runtime accepts them, "
+                    + "but analysis tools may not resolve quickened references "
+                    + "(the DexFile dev branch ships a smali printer that handles "
+                    + "odex/legacy/expanded opcodes)";
+
+    /**
+     * Write a full dex, mapping the remaining constraint failure to an honest
+     * error: with odex instructions enabled and legacy instructions rewritten,
+     * this only fires for genuinely incompatible target choices.
      */
     private static void writeDex(String path, WriteOptions opts, Dex dex) {
         byte[] out;
@@ -268,10 +306,10 @@ final class Commands {
             if (msg.contains("Constraints for opcode")) {
                 String op = msg.substring(msg.indexOf("opcode ") + 7);
                 op = op.substring(0, op.contains(" ") ? op.indexOf(' ') : op.length());
-                throw new DexIO.InvalidDexFile("the dex contains odex-only instructions (first: "
-                        + op + ") — a faithful standard write needs de-odexing (resolving optimized "
-                        + "opcodes back to plain references), which current DexFile does not do; "
-                        + "info and extract still work on this file");
+                throw new DexIO.InvalidDexFile("cannot write opcode " + op + " into the chosen "
+                        + "target — era-specific instructions pin the targetApi range, so try "
+                        + "another --to (e.g. dalvik-era odex like invoke-direct-empty needs "
+                        + "--to 035; the write target uses the version's own minimum api)");
             }
             throw e;
         }
@@ -464,9 +502,15 @@ final class Commands {
         } else {
             ReadResult rr = readAny(data, apiOverride, true);
             String path = outPath != null ? outPath : defaultOut(input, "." + shortVer(target) + ".dex");
-            writeDex(path, writeOptions(target), rr.dex);
-            converted.add(Json.obj("path", path, "from", rr.version.name(), "to", target.name(),
-                    "classes", rr.cache.getClasses().size(), "detected", rr.detected));
+            writeDex(path, writeOptions(target), toModernIfNeeded(rr.version, rr.dex));
+            int odex = countOdexInstructions(rr.dex);
+            Map<String, Object> entry = Json.obj("path", path, "from", rr.version.name(), "to", target.name(),
+                    "classes", rr.cache.getClasses().size(), "detected", rr.detected);
+            if (odex > 0) {
+                entry.put("odex_instructions", odex);
+                entry.put("note", ODEX_NOTE);
+            }
+            converted.add(entry);
         }
         return Json.obj("input", input, "target_version", target.name(), "converted", converted);
     }
@@ -521,7 +565,8 @@ final class Commands {
         requireSingleDex(rr, "split");
         String dir = outDir != null ? outDir : defaultOut(input, "_split");
         WriteOptions opts = writeOptions(parseVersion("035"));
-        List<Dex> parts = DexIO.balanceAll(opts, rr.cache.getClasses());
+        List<Dex> parts = DexIO.balanceAll(opts,
+                toModernIfNeeded(rr.version, rr.dex).getClasses());
         String stem = Path.of(input).getFileName().toString();
         if (stem.endsWith(".dex")) {
             stem = stem.substring(0, stem.length() - 4);
@@ -574,28 +619,35 @@ final class Commands {
         ReadResult rr = readAny(data, apiOverride, true);
         requireSingleDex(rr, "patch");
         OpRewriter rewriter = new OpRewriter(ops);
-        Dex patched = rewriter.rewriteDex(rr.dex);
+        Dex patched = rewriter.rewriteDex(toModernIfNeeded(rr.version, rr.dex));
 
         DexVersion original = rr.version;
         // cdex 001 is Android 9 (API 28) era ART output — rewrite it to DEX037
-        // (API 26+, the closest standard version) rather than dropping to 035.
+        // (introduced in API 24, covering the cdex era with room to spare)
+        // rather than dropping to 035.
         DexVersion target = original.isCompact() ? DexVersion.DEX037 : original;
         WriteOptions opts = writeOptions(target);
         String path = outPath != null ? outPath : input; // .bak is the Python side's job
         writeDex(path, opts, patched);
 
+        int odex = countOdexInstructions(patched);
         List<Object> opResults = new ArrayList<>();
         for (Map<String, Object> op : ops) {
             String type = String.valueOf(op.get("op"));
             opResults.add(Json.obj("op", type, "matched", rewriter.matched.getOrDefault(type, 0)));
         }
-        return Json.obj(
+        Map<String, Object> out = Json.obj(
                 "in", input,
                 "out", path,
                 "version_from", original.name(),
                 "version_to", target.name(),
+                "odex_instructions", odex,
                 "ops", opResults,
                 "note", "matched=0 means the op found nothing — check class/method names");
+        if (odex > 0) {
+            out.put("odex_note", ODEX_NOTE);
+        }
+        return out;
     }
 
     private static void requireOp(Map<String, Object> op) {
