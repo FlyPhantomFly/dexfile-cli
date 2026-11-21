@@ -65,6 +65,7 @@ java -jar build/libs/dexfile-cli.jar <subcommand> [options]
 | `patch <dex> --ops <ops.json>` | apply the ops described below |
 | `assemble <smali_file>` | one smali class → dex |
 | `split <dex>` | shard the class list across dex files under the 64K-reference limit; the balancer picks the part count |
+| `outline <dex> --class <name>` | per-class outline without decompiling — descriptor, super, interfaces, formatted access flags, fields (name/type/flags), methods (name/descriptor/flags/registers), annotation count, dex version; class names are Java-style dotted, like the patch ops |
 
 Options:
 

@@ -23,6 +23,7 @@ public final class Main {
               dexfile-cli patch <dex> --ops <ops.json> [--out PATH] [--api N]
               dexfile-cli assemble <smali_file> [--out PATH] [--api N]
               dexfile-cli split <dex> [--out DIR] [--api N]
+              dexfile-cli outline <dex> --class <dotted class name> [--api N]
 
             ops file: a JSON array of operations:
               {"op": "replace-const-string", "old": "...", "new": "..."}
