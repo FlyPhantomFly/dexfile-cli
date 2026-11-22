@@ -636,9 +636,10 @@ final class Commands {
         requireSingleDex(rr, "validate");
         Dex dex = toModernIfNeeded(rr.version, rr.dex);
 
-        // self-contained classpath: only this dex's own classes are known;
-        // framework classes resolve to null ("outside the classpath") and
-        // are reported as unknown, not as errors.
+        // self-contained classpath: only this dex's own classes are known.
+        // A hierarchy that leaves the dex makes resolution non-determinable
+        // (Result.exact() == false) — those references are counted as
+        // unknown, never reported as broken.
         Map<TypeId, ClassDef> byType = new LinkedHashMap<>();
         for (ClassDef cls : dex.getClasses()) {
             byType.putIfAbsent(cls.getType(), cls);
@@ -647,8 +648,11 @@ final class Commands {
                 new com.v7878.dex.analysis.ClassPath(byType::get);
 
         List<Object> issues = new ArrayList<>();
-        int cap = maxIssues != null ? Math.max(1, maxIssues) : 200;
-        boolean truncated = false;
+        int cap = maxIssues != null ? maxIssues : 200;
+        if (cap <= 0) {
+            throw new UsageException("--max-issues must be positive");
+        }
+        int issueTotal = 0;
         int classesChecked = 0;
         int methodsAnalyzed = 0;
         int duplicates = 0;
@@ -659,12 +663,11 @@ final class Commands {
                 continue;
             }
             duplicates++;
+            issueTotal++;
             if (issues.size() < cap) {
                 issues.add(Json.obj("severity", "error", "kind", "duplicate_class",
                         "class", cls.getType().getName(),
                         "message", "class defined more than once"));
-            } else {
-                truncated = true;
             }
         }
 
@@ -672,14 +675,14 @@ final class Commands {
             classesChecked++;
             String cname = cls.getType().getName();
             if (cls.getSuperclass() != null && byType.containsKey(cls.getSuperclass())
-                    && byType.get(cls.getSuperclass()).isInterface()
-                    && issues.size() < cap) {
-                issues.add(Json.obj("severity", "error", "kind", "super_is_interface",
-                        "class", cname,
-                        "message", "superclass " + cls.getSuperclass().getName()
-                                + " is an interface"));
-            } else if (issues.size() >= cap) {
-                truncated = true;
+                    && byType.get(cls.getSuperclass()).isInterface()) {
+                issueTotal++;
+                if (issues.size() < cap) {
+                    issues.add(Json.obj("severity", "error", "kind", "super_is_interface",
+                            "class", cname,
+                            "message", "superclass " + cls.getSuperclass().getName()
+                                    + " is an interface"));
+                }
             }
             for (MethodDef m : cls.getMethods()) {
                 if (m.getImplementation() == null) {
@@ -691,53 +694,62 @@ final class Commands {
                             com.v7878.dex.analysis.AnalysisOptions.defaultOptions());
                     methodsAnalyzed++;
                 } catch (com.v7878.dex.analysis.AnalysisException e) {
+                    issueTotal++;
                     if (issues.size() < cap) {
                         issues.add(Json.obj("severity", "error", "kind", "analysis_failed",
                                 "class", cname, "method", m.getName(),
                                 "descriptor", m.getProto().getDescriptor(),
                                 "message", String.valueOf(e.getMessage())));
-                    } else {
-                        truncated = true;
                     }
                 } catch (RuntimeException e) {
+                    issueTotal++;
                     if (issues.size() < cap) {
                         issues.add(Json.obj("severity", "warning", "kind", "analysis_skipped",
                                 "class", cname, "method", m.getName(),
                                 "message", String.valueOf(e.getMessage())));
-                    } else {
-                        truncated = true;
                     }
                 }
             }
         }
 
-        // member-reference resolution for ids whose declaring class is in this dex
+        // Member-reference resolution for ids whose declaring class is in this
+        // dex. Only exact results are diagnostics: an inexact result means the
+        // hierarchy (usually the framework) leaves the classpath, so the real
+        // runtime could resolve it — counted as unknown, not broken.
+        int refsChecked = 0;
         int refsResolved = 0;
+        int refsUnknown = 0;
+        int refErrors = 0;
         for (com.v7878.dex.immutable.MethodId mid : rr.cache.getMethods()) {
             if (!byType.containsKey(mid.getDeclaringClass())) {
                 continue;
             }
+            refsChecked++;
             try {
-                var result = cp.resolveMethod(mid);
-                refsResolved++;
-                if (result.error() != com.v7878.dex.analysis.ClassPath.ResolutionError.NONE) {
-                    if (issues.size() < cap) {
-                        issues.add(Json.obj("severity", "error", "kind", "unresolved_method",
-                                "class", mid.getDeclaringClass().getName(),
-                                "method", mid.getName(),
-                                "message", result.error() + (result.message() != null
-                                        ? ": " + result.message() : "")));
-                    } else {
-                        truncated = true;
-                    }
+                var r = cp.resolveMethod(mid);
+                if (!r.exact()) {
+                    refsUnknown++;
+                    continue;
+                }
+                if (r.error() == com.v7878.dex.analysis.ClassPath.ResolutionError.NONE) {
+                    refsResolved++;
+                    continue;
+                }
+                refErrors++;
+                issueTotal++;
+                if (issues.size() < cap) {
+                    issues.add(Json.obj("severity", "error", "kind", "unresolved_method",
+                            "class", mid.getDeclaringClass().getName(),
+                            "method", mid.getName(),
+                            "message", r.error() + (r.message() != null
+                                    ? ": " + r.message() : "")));
                 }
             } catch (RuntimeException e) {
+                issueTotal++;
                 if (issues.size() < cap) {
                     issues.add(Json.obj("severity", "warning", "kind", "resolution_skipped",
                             "class", mid.getDeclaringClass().getName(), "method", mid.getName(),
                             "message", String.valueOf(e.getMessage())));
-                } else {
-                    truncated = true;
                 }
             }
         }
@@ -745,46 +757,57 @@ final class Commands {
             if (!byType.containsKey(fid.getDeclaringClass())) {
                 continue;
             }
+            refsChecked++;
             try {
-                var result = cp.resolveField(fid);
-                refsResolved++;
-                if (result.error() != com.v7878.dex.analysis.ClassPath.ResolutionError.NONE) {
-                    if (issues.size() < cap) {
-                        issues.add(Json.obj("severity", "error", "kind", "unresolved_field",
-                                "class", fid.getDeclaringClass().getName(),
-                                "field", fid.getName(),
-                                "message", result.error() + (result.message() != null
-                                        ? ": " + result.message() : "")));
-                    } else {
-                        truncated = true;
-                    }
+                var r = cp.resolveField(fid);
+                if (!r.exact()) {
+                    refsUnknown++;
+                    continue;
+                }
+                if (r.error() == com.v7878.dex.analysis.ClassPath.ResolutionError.NONE) {
+                    refsResolved++;
+                    continue;
+                }
+                refErrors++;
+                issueTotal++;
+                if (issues.size() < cap) {
+                    issues.add(Json.obj("severity", "error", "kind", "unresolved_field",
+                            "class", fid.getDeclaringClass().getName(),
+                            "field", fid.getName(),
+                            "message", r.error() + (r.message() != null
+                                    ? ": " + r.message() : "")));
                 }
             } catch (RuntimeException e) {
+                issueTotal++;
                 if (issues.size() < cap) {
                     issues.add(Json.obj("severity", "warning", "kind", "resolution_skipped",
                             "class", fid.getDeclaringClass().getName(), "field", fid.getName(),
                             "message", String.valueOf(e.getMessage())));
-                } else {
-                    truncated = true;
                 }
             }
         }
 
-        boolean ok = issues.isEmpty() && duplicates == 0 && !truncated;
+        boolean truncated = issueTotal > issues.size();
+        boolean ok = issueTotal == 0;
         return Json.obj(
                 "file", input,
                 "version", rr.version.name(),
                 "classes_checked", classesChecked,
                 "methods_analyzed", methodsAnalyzed,
+                "references_checked", refsChecked,
                 "references_resolved", refsResolved,
+                "references_unknown", refsUnknown,
+                "reference_errors", refErrors,
                 "duplicate_classes", duplicates,
+                "issues_total", issueTotal,
                 "issues_shown", issues.size(),
                 "truncated", truncated,
                 "issues", issues,
                 "ok", ok,
-                "note", "self-contained classpath: framework classes are outside it and "
-                        + "are not flagged; diagnostics from DexFile's ClassPath/analysis "
-                        + "package — the dex-level analog of smali_diagnostics");
+                "note", "self-contained classpath: references whose hierarchy leaves this dex "
+                        + "(framework classes) are counted as unknown, not flagged; "
+                        + "diagnostics from DexFile's ClassPath/analysis package — the "
+                        + "dex-level analog of smali_diagnostics");
     }
 
     // ── merge ─────────────────────────────────────────────────────────────
@@ -794,7 +817,18 @@ final class Commands {
         if (inputs.size() < 2) {
             throw new UsageException("merge needs at least two dex files");
         }
-        DexVersion target = DexVersion.forApi(apiOverride != null ? apiOverride : 21);
+        DexVersion target;
+        if (allowCdex) {
+            target = DexVersion.CDEX001;
+            if (apiOverride != null && (apiOverride < target.getMinApi()
+                    || apiOverride > target.getMaxApi())) {
+                throw new UsageException("cdex output requires --api "
+                        + target.getMinApi() + ".." + target.getMaxApi()
+                        + " (got " + apiOverride + ")");
+            }
+        } else {
+            target = DexVersion.forApi(apiOverride != null ? apiOverride : 21);
+        }
         WriteOptions opts = writeOptions(target);
 
         List<ClassDef> classes = new ArrayList<>();
@@ -821,8 +855,18 @@ final class Commands {
         }
 
         String path = outPath != null ? outPath : defaultOut(inputs.get(0), ".merged.dex");
-        writeDex(path, opts, Dex.of(classes));
+        try {
+            writeDex(path, opts, Dex.of(classes));
+        } catch (IllegalStateException e) {
+            String message = String.valueOf(e.getMessage());
+            if (message.contains("should not exceed limit")) {
+                throw new UsageException("merged dex exceeds a 64K section limit: " + message
+                        + " — split the inputs first and merge each shard separately");
+            }
+            throw e;
+        }
         boolean cdexOut = target.isCompact();
+        boolean containerOut = target.isDexContainer();
         return Json.obj(
                 "inputs", inputs,
                 "out", path,
@@ -831,9 +875,12 @@ final class Commands {
                 "per_input", perInput,
                 "source_versions", versions,
                 "cdex_written", cdexOut,
+                "container_written", containerOut,
                 "note", cdexOut
                         ? "cdex output is a standalone/analysis artifact — not PathClassLoader-loadable on-device"
-                        : "merged into a single dex; if the reference count exceeds 64K the write would have failed — split first");
+                        : containerOut
+                        ? "merged into a single-component DEX041 container; each component still observes the 64K section limits"
+                        : "merged into a single dex; if a section exceeds 64K the write fails with the limit named — split first");
     }
 
     // ── patch ─────────────────────────────────────────────────────────────

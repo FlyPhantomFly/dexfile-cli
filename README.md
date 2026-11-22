@@ -2,10 +2,11 @@
 
 A command-line tool for working with Android dex files: inspect them, pull dexes out of an
 APK, convert between dex versions, apply small targeted patches, assemble a class from
-smali, split a big dex under the 64K-reference limit. All the format-heavy lifting is done
+smali, validate a dex's linkage and method bodies, merge dexes back into one, split a big
+dex under the 64K-reference limit. All the format-heavy lifting is done
 by [DexFile](https://github.com/vova7878/DexFile) and [Smali](https://github.com/vova7878/DexFile/tree/main/smali)
 (Vladimir Kozelkov's `com.v7878` libraries); this repo wraps them in a single self-contained
-jar with six subcommands.
+jar with nine subcommands.
 
 Every invocation prints exactly one JSON object on stdout; human-readable logs go to stderr.
 That contract is deliberate — the tool is meant to be driven by scripts and other programs,
@@ -27,7 +28,7 @@ adds the command-line shell around them.
 
 | | DexFile (upstream) | dexfile-cli (this repo) |
 | --- | --- | --- |
-| Shape | Java library (`com.v7878.dex.*`) — you write Java/Kotlin against its API | Runnable CLI — six subcommands, no code to write |
+| Shape | Java library (`com.v7878.dex.*`) — you write Java/Kotlin against its API | Runnable CLI — nine subcommands, no code to write |
 | Output | In-process objects you consume however you like | One JSON object per run on stdout, logs on stderr, fixed exit codes |
 | Reading | Reads whatever you point it at: flat dex, containers, cdex | Same, plus a magic-scan fallback that hunts for dex/cdex magics anywhere in the file (vdex-era cdex, packer-shuffled dex, dey-embedded dex) and an API ladder (34 → 28 → 21 → 19 → min; pre-release 009/013 pinned to their era) that retries the read under different target-API interpretations, odex instructions always enabled |
 | APKs | — | `extract` walks a zip and pulls out every `classes*.dex` (041 containers get split into parts) |
@@ -61,10 +62,12 @@ java -jar build/libs/dexfile-cli.jar <subcommand> [options]
 | --- | --- |
 | `info <dex\|container\|vdex>` | version, target API, class/method/field/string counts; `--classes` adds a sorted class list (first 100, or `--limit N`) — and switches to a full-model read, see below |
 | `extract <apk\|dex\|vdex>` | pull every `classes*.dex` into a directory (default `<input>_dex_extract`) |
-| `convert <in> --to 035…041` | read any supported version → write the target version (for cdex/vdex-era content, 037 is the closest target — see limits) |
+| `convert <in> --to 035…041\|cdex001` | read any supported version → write the target version (for cdex/vdex-era content, 037 is the closest standard target — see limits). `cdex001` writes a standalone artifact, not a loadable dex |
 | `patch <dex> --ops <ops.json>` | apply the ops described below |
 | `assemble <smali_file>` | one smali class → dex |
 | `split <dex>` | shard the class list across dex files under the 64K-reference limit; the balancer picks the part count |
+| `validate <dex>` | linkage + method-body diagnostics over a self-contained classpath: duplicate classes, super-is-interface, member-reference resolution errors, per-method analysis failures. Framework classes are outside the classpath — those references are counted `references_unknown`, never flagged. `--max-issues N` caps the shown list (default 200); `issues_total` and `truncated` keep the count honest |
+| `merge <dex...>` | the reverse of `split`: concatenate class lists into one dex, refusing class collisions across inputs. `--allow-cdex` writes standalone cdex; `--api 35` writes a single-component DEX041 container |
 | `outline <dex> --class <name>` | per-class outline without decompiling — descriptor, super, interfaces, formatted access flags, fields (name/type/flags), methods (name/descriptor/flags/registers), annotation count, dex version; class names are Java-style dotted, like the patch ops |
 
 Options:
@@ -72,6 +75,10 @@ Options:
 * `--out PATH` — where to write. Defaults are sensible-ish (`app.vdex` → `app.035.dex`,
   directories `<input>_dex_extract` and `<input>_split`), but note that **`patch` overwrites
   its input file when you omit `--out`** — pass `--out` or keep a copy.
+* `--max-issues N` — `validate`'s shown-issue cap (default 200). The result always carries
+  `issues_total`, `issues_shown` and `truncated`.
+* `--allow-cdex` — `merge` output as standalone cdex (a conversion/analysis artifact, not
+  PathClassLoader-loadable on-device).
 * `--api N` — pin the target-API interpretation. Without it, the reader climbs an API
   ladder (34, 28, 21, 19, then the version's minimum; the pre-release dexes 009/013 pin
   exactly their own era api). Odex instructions are always enabled on reads and writes:
@@ -164,7 +171,8 @@ Worth knowing:
   the dex lives in the APK. The magic scan honestly reports "no readable dex magic" for
   those. Everything older that embeds cdex or dex parts reads (see above).
 * cdex can only be *written* as a standalone file, which isn't loadable via
-  `PathClassLoader` on-device — treat it as a conversion/analysis artifact. For standard
+  `PathClassLoader` on-device — treat it as a conversion/analysis artifact. `convert --to
+  cdex001` and `merge --allow-cdex` are the opt-ins for writing it. For standard
   targets, DEX037 (introduced in API 24) is the right landing for cdex-era content: cdex
   doesn't record the dex version it was converted from — just a one-bit flags field
   (0 = the source was a DEX035, 1 = later) — and the difference is verification
@@ -172,8 +180,17 @@ Worth knowing:
   require classes in topological order (super before sub — cycles are even representable,
   though unloadable), while 037+ enforces the order. `patch` rewrites cdex to 037 by
   default; for `convert`, pass `--to 037`.
-* `patch` and `split` want a single dex; hand them a 041 container and they'll tell you to
-  run `extract` or `convert` first.
+* `patch`, `split`, `validate` and `merge` want a single dex; hand them a 041 container and
+  they'll tell you to run `extract` or `convert` first.
+* **`validate` is not the ART verifier.** It runs DexFile's `ClassPath`/`analysis` package
+  over only the classes in the file: a reference whose hierarchy leaves the dex (framework
+  classes) is non-determinable and counted in `references_unknown`, never reported as
+  broken. Quickened odex instructions are not analyzable (`analysis_failed` names the
+  limitation). Treat findings as diagnostics, not a runtime verdict.
+* **`merge` does not rebalance.** It refuses duplicate classes across inputs and writes one
+  dex; if any id section exceeds the 64K limit the write fails with the section named.
+  Split the inputs first and merge each shard. `--api 35` produces a single-component DEX041
+  container, which is still subject to the per-component limits.
 
 ## Credits
 

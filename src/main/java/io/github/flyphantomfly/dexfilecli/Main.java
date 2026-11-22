@@ -19,7 +19,7 @@ public final class Main {
             usage:
               dexfile-cli info <dex|container|vdex> [--api N] [--classes] [--limit N]
               dexfile-cli extract <apk|dex|vdex> [--out DIR] [--api N]
-              dexfile-cli convert <in> --to 035|036|037|038|039|040|041 [--out PATH] [--api N]
+              dexfile-cli convert <in> --to 035|036|037|038|039|040|041|cdex001 [--out PATH] [--api N]
               dexfile-cli patch <dex> --ops <ops.json> [--out PATH] [--api N]
               dexfile-cli assemble <smali_file> [--out PATH] [--api N]
               dexfile-cli split <dex> [--out DIR] [--api N]
@@ -127,17 +127,12 @@ public final class Main {
             }
             case "validate" -> {
                 require(positional.size() == 1, "validate needs exactly one dex file");
-                out = Commands.validate(positional.get(0), api,
-                        flags.containsKey("max-issues") ? Integer.parseInt(flags.get("max-issues")) : null);
+                out = Commands.validate(positional.get(0), api, intFlag(flags, "max-issues"));
             }
             case "merge" -> {
                 require(positional.size() >= 2, "merge needs at least two dex files");
-                boolean allowCdex = flags.containsKey("allow-cdex");
-                Integer mergeApi = flags.containsKey("api") ? api : null;
-                if (allowCdex && mergeApi == null) {
-                    mergeApi = 28; // CDEX001's floor — writeOptions validates the era
-                }
-                out = Commands.merge(positional, flags.get("out"), mergeApi, allowCdex);
+                out = Commands.merge(positional, flags.get("out"), api,
+                        flags.containsKey("allow-cdex"));
             }
             default -> {
                 System.err.print(USAGE);
