@@ -24,6 +24,8 @@ public final class Main {
               dexfile-cli assemble <smali_file> [--out PATH] [--api N]
               dexfile-cli split <dex> [--out DIR] [--api N]
               dexfile-cli outline <dex> --class <dotted class name> [--api N]
+              dexfile-cli validate <dex> [--max-issues N] [--api N]
+              dexfile-cli merge <dex...> [--out PATH] [--api N] [--allow-cdex]
 
             ops file: a JSON array of operations:
               {"op": "replace-const-string", "old": "...", "new": "..."}
@@ -122,6 +124,20 @@ public final class Main {
             case "split" -> {
                 require(positional.size() == 1, "split needs exactly one dex file");
                 out = Commands.split(positional.get(0), flags.get("out"), api);
+            }
+            case "validate" -> {
+                require(positional.size() == 1, "validate needs exactly one dex file");
+                out = Commands.validate(positional.get(0), api,
+                        flags.containsKey("max-issues") ? Integer.parseInt(flags.get("max-issues")) : null);
+            }
+            case "merge" -> {
+                require(positional.size() >= 2, "merge needs at least two dex files");
+                boolean allowCdex = flags.containsKey("allow-cdex");
+                Integer mergeApi = flags.containsKey("api") ? api : null;
+                if (allowCdex && mergeApi == null) {
+                    mergeApi = 28; // CDEX001's floor — writeOptions validates the era
+                }
+                out = Commands.merge(positional, flags.get("out"), mergeApi, allowCdex);
             }
             default -> {
                 System.err.print(USAGE);
