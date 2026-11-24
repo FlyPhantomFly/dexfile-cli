@@ -6,21 +6,15 @@ plugins {
 }
 
 group = "io.github.flyphantomfly"
-version = "0.2.0"
+version = "0.2.1"
 
 repositories {
     mavenCentral()
 }
 
 dependencies {
-    // Vendored upstream `main` @ b3fd141 (unreleased: 20bc/40sc reader, smali printer) —
-    // see vendor/README.md; revert to Maven Central pins when upstream tags v1.8.0+.
-    implementation(files("vendor/DexFile-b3fd141.jar", "vendor/Smali-b3fd141.jar"))
-    // DexFile's runtime dependency — with files() deps the vendored POM isn't read,
-    // so AndroidMisc must be declared explicitly. The vendored Smali module's generated
-    // parser needs the ANTLR runtime the same way (upstream pins 4.13.2).
-    implementation("io.github.vova7878:AndroidMisc:v1.0.1")
-    implementation("org.antlr:antlr4-runtime:4.13.2")
+    implementation("io.github.vova7878:DexFile:v1.7.1")
+    implementation("io.github.vova7878:Smali:v1.7.1")
 }
 
 java {
