@@ -52,12 +52,10 @@ The wrapper downloads Gradle 9.8.1 on first run, so all you need is a JDK it can
 (this repo is built with JDK 21). The bytecode targets Java 17, so at runtime any JRE 17+
 is fine.
 
-**Dependencies:** `DexFile` and `Smali` are currently **vendored** under `vendor/`
-(upstream `main` @ `b3fd141` — the 20bc/40sc verification-error instruction support and
-the smali printer, which upstream has not released yet; see `vendor/README.md`), with
-`AndroidMisc` (v1.0.1) and the ANTLR runtime (4.13.2, needed by the new Smali parser) from
-Maven Central. When upstream tags the next release, drop the vendored jars and restore the
-Maven pins — the plan is written down in `vendor/README.md`.
+**Dependencies:** `DexFile` and `Smali` are pinned at **v1.7.1** from Maven Central
+(upstream tagged v1.7.1 at the commit this repo briefly vendored — the vendored jars were
+content-identical to the release and have been retired; AndroidMisc v1.0.1 and the ANTLR
+runtime 4.13.2 come transitively via the published POMs).
 
 ## Usage
 
