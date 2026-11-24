@@ -69,7 +69,8 @@ final class Commands {
         // levels 19 and 20 shipped both runtimes; we read them as dalvik-era.
         return ReadOptions.defaultOptions().withTargetApi(api)
                 .withTargetForArt(api > 20)
-                .withOdexInstructions(true);
+                .withOdexInstructions(true)
+                .withExpandedInstructions(api >= 14 && api <= 15);
     }
 
     /**
@@ -225,7 +226,11 @@ final class Commands {
     }
 
     private static WriteOptions writeOptions(DexVersion target) {
-        int api = target.getMinApi();
+        return writeOptions(target, null);
+    }
+
+    private static WriteOptions writeOptions(DexVersion target, Integer apiOverride) {
+        int api = apiOverride != null ? apiOverride : target.getMinApi();
         // DexOptions derives art = api > LAST_DALVIK_TARGET (20), but withers
         // keep the CURRENT art flag — set it explicitly to stay consistent.
         // odex instructions are written verbatim: the runtime accepts them in any
@@ -234,7 +239,8 @@ final class Commands {
                 .withDexVersion(target)
                 .withTargetApi(api)
                 .withTargetForArt(api > 20)
-                .withOdexInstructions(true);
+                .withOdexInstructions(true)
+                .withExpandedInstructions(api >= 14 && api <= 15);
     }
 
     private static byte[] readFile(String path) {
@@ -550,7 +556,7 @@ final class Commands {
             target = DexVersion.forApi(apiOverride);
         }
         String path = outPath != null ? outPath : defaultOut(label, ".dex");
-        writeFile(path, DexIO.write(writeOptions(target), Dex.of(cls)));
+        writeFile(path, DexIO.write(writeOptions(target, apiOverride), Dex.of(cls)));
         return Json.obj(
                 "out", path,
                 "class", cls.getType().getName(),
@@ -610,7 +616,7 @@ final class Commands {
         ReadResult rr = readAny(data, apiOverride, true);
         requireSingleDex(rr, "split");
         String dir = outDir != null ? outDir : defaultOut(input, "_split");
-        WriteOptions opts = writeOptions(parseVersion("035"));
+        WriteOptions opts = writeOptions(parseVersion("035"), apiOverride);
         List<Dex> parts = DexIO.balanceAll(opts,
                 toModernIfNeeded(rr.version, rr.dex).getClasses());
         String stem = Path.of(input).getFileName().toString();
@@ -829,7 +835,7 @@ final class Commands {
         } else {
             target = DexVersion.forApi(apiOverride != null ? apiOverride : 21);
         }
-        WriteOptions opts = writeOptions(target);
+        WriteOptions opts = writeOptions(target, apiOverride);
 
         List<ClassDef> classes = new ArrayList<>();
         Map<TypeId, String> owner = new LinkedHashMap<>();
@@ -927,7 +933,7 @@ final class Commands {
         // (introduced in API 24, covering the cdex era with room to spare)
         // rather than dropping to 035.
         DexVersion target = original.isCompact() ? DexVersion.DEX037 : original;
-        WriteOptions opts = writeOptions(target);
+        WriteOptions opts = writeOptions(target, apiOverride);
         String path = outPath != null ? outPath : input; // .bak is the Python side's job
         writeDex(path, opts, patched);
 
@@ -1101,7 +1107,18 @@ final class Commands {
             for (Map<String, Object> op : opsOf("replace-method-body")) {
                 if (matches(op, "class", ownerName()) && matches(op, "method", value.getName())) {
                     try {
-                        MethodDef parsed = SmaliIO.parseMethod(String.valueOf(op.get("smali")));
+                        String body = String.valueOf(op.get("smali")).strip();
+                        if (body.endsWith(".end method")) {
+                            body = body.substring(0, body.length() - ".end method".length()).stripTrailing();
+                        }
+                        if (!body.startsWith(".method ")) {
+                            // the vendored Smali (upstream main) parses full methods
+                            // only — wrap a bare body fragment in a synthetic frame
+                            body = ".method public synthetic " + value.getName()
+                                    + value.getProto().getDescriptor() + "\n"
+                                    + body + "\n.end method";
+                        }
+                        MethodDef parsed = SmaliIO.parseMethod(body);
                         // preserve the original hidden-API flags: the smali text cannot express them
                         result = MethodDef.unchecked(parsed.getName(), parsed.getReturnType(),
                                 parsed.getParameters(), parsed.getAccessFlags(),
