@@ -27,6 +27,13 @@ public final class Main {
               dexfile-cli validate <dex> [--max-issues N] [--api N]
               dexfile-cli merge <dex...> [--out PATH] [--api N] [--allow-cdex]
 
+            global flags (usable on any subcommand):
+              --api N                     pin the target-API interpretation (read + write)
+              --era dalvik|art            pin the runtime era on read + write
+              --scan                      info: walk instruction bodies (odex/ambiguity report)
+              --allow-ambiguous-odex      proceed past era-ambiguous odex opcodes
+                                          (convert/patch/merge/split; warning in the JSON)
+
             ops file: a JSON array of operations:
               {"op": "replace-const-string", "old": "...", "new": "..."}
               {"op": "rename", "target": "class|method|field", "class": "a.b.C",
@@ -52,6 +59,11 @@ public final class Main {
             System.out.println(Json.encode(Json.obj("error", String.valueOf(e.getMessage()),
                     "kind", "invalid_dex")));
             exit = 4;
+        } catch (Commands.AmbiguousOdexException e) {
+            System.err.println("ambiguous-odex: " + e.getMessage());
+            System.out.println(Json.encode(Json.obj("error", String.valueOf(e.getMessage()),
+                    "kind", "ambiguous_odex")));
+            exit = 5;
         } catch (Commands.UsageException e) {
             System.err.println("usage: " + e.getMessage());
             System.out.println(Json.encode(Json.obj("error", String.valueOf(e.getMessage()),
@@ -88,6 +100,12 @@ public final class Main {
             }
         }
         Integer api = intFlag(flags, "api");
+        String era = flags.get("era");
+        if (era != null && !era.equals("dalvik") && !era.equals("art")) {
+            throw new Commands.UsageException("--era expects 'dalvik' or 'art', got '" + era + "'");
+        }
+        boolean allowAmbiguous = flags.containsKey("allow-ambiguous-odex");
+        boolean scan = flags.containsKey("scan");
         Integer limit = intFlag(flags, "limit");
 
         Map<String, Object> out;
@@ -96,42 +114,42 @@ public final class Main {
                 require(positional.size() == 1, "info needs exactly one input file");
                 boolean listClasses = flags.containsKey("classes");
                 int limitValue = limit != null ? limit : 100;
-                out = Commands.info(positional.get(0), api, listClasses, limitValue);
+                out = Commands.info(positional.get(0), api, listClasses, limitValue, era, scan);
             }
             case "extract" -> {
                 require(positional.size() == 1, "extract needs exactly one input file");
-                out = Commands.extract(positional.get(0), flags.get("out"), api);
+                out = Commands.extract(positional.get(0), flags.get("out"), api, era);
             }
             case "convert" -> {
                 require(positional.size() == 1, "convert needs exactly one input file");
                 require(flags.containsKey("to"), "convert needs --to 035|036|037|038|039|040|041");
-                out = Commands.convert(positional.get(0), flags.get("to"), flags.get("out"), api);
+                out = Commands.convert(positional.get(0), flags.get("to"), flags.get("out"), api, era, allowAmbiguous);
             }
             case "patch" -> {
                 require(positional.size() == 1, "patch needs exactly one dex file");
                 require(flags.containsKey("ops"), "patch needs --ops <ops.json>");
-                out = Commands.patch(positional.get(0), flags.get("ops"), flags.get("out"), api);
+                out = Commands.patch(positional.get(0), flags.get("ops"), flags.get("out"), api, era, allowAmbiguous);
             }
             case "assemble" -> {
                 require(positional.size() == 1, "assemble needs exactly one smali file");
-                out = Commands.assemble(positional.get(0), flags.get("out"), api);
+                out = Commands.assemble(positional.get(0), flags.get("out"), api, era);
             }
             case "outline" -> {
                 require(positional.size() == 1, "outline needs exactly one dex file");
                 require(flags.containsKey("class"), "outline needs --class <dotted class name>");
-                out = Commands.outline(positional.get(0), flags.get("class"), api);
+                out = Commands.outline(positional.get(0), flags.get("class"), api, era);
             }
             case "split" -> {
                 require(positional.size() == 1, "split needs exactly one dex file");
-                out = Commands.split(positional.get(0), flags.get("out"), api);
+                out = Commands.split(positional.get(0), flags.get("out"), api, era, allowAmbiguous);
             }
             case "validate" -> {
                 require(positional.size() == 1, "validate needs exactly one dex file");
-                out = Commands.validate(positional.get(0), api, intFlag(flags, "max-issues"));
+                out = Commands.validate(positional.get(0), api, intFlag(flags, "max-issues"), era);
             }
             case "merge" -> {
                 require(positional.size() >= 2, "merge needs at least two dex files");
-                out = Commands.merge(positional, flags.get("out"), api,
+                out = Commands.merge(positional, flags.get("out"), api, era, allowAmbiguous,
                         flags.containsKey("allow-cdex"));
             }
             default -> {

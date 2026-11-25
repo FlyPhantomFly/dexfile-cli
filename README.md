@@ -151,8 +151,8 @@ Worth knowing:
   decompile the result before you trust it).
 * Round-trips re-serialize: the semantic content survives, the byte layout does not. Don't
   rely on offsets or expect byte-identical output.
-* **Quickened odex opcodes are written verbatim, and that's fine on-device.** The runtime
-  accepts every instruction it supports regardless of the dex version carrying it, so
+* **Odex opcodes are written verbatim — with one guarded exception.** The runtime accepts
+  every instruction it supports regardless of the dex version carrying it, so
   `convert`/`patch`/`split` write odex opcodes (odex instructions are enabled on every
   write) instead of refusing. Verified against a 19 MB Android-12 boot vdex (vdex 019,
   three embedded cdex parts, 13,754 framework classes, ~330k odex instructions): reading
@@ -161,8 +161,19 @@ Worth knowing:
   count. The results report an `odex_instructions` count and a note — quickened references
   (`invoke-virtual-quick`, `iget/iput-quick`) carry raw vtable/field offsets, so analysis
   tools can only show them as unresolved (baksmali 3 annotates them as comments; the
-  DexFile dev branch ships a smali printer that handles odex/legacy/expanded opcodes
+  vendored DexFile v1.7.1 ships a smali printer that handles odex/legacy/expanded opcodes
   natively).
+* **Era-ambiguous odex bytes are the exception, and the CLI now guards them.** Some odex
+  bytes decode as *different instructions* depending on the reader's dalvik-vs-art era —
+  22 such bytes exist for DEX035 with odex enabled (e.g. `0xed` is `iput-char-quick` under
+  art-era options and `throw-verification-error` under dalvik-era options; the full table
+  is in the skill pack's `opcode-numbers.md`). The file carries no era info, so the read
+  ladder's guess decides. When such an instruction is present and the write's api/era
+  differs from the read's, `convert`/`patch`/`merge`/`split` now **refuse** (kind
+  `ambiguous_odex`, exit 5) instead of silently re-encoding a different meaning;
+  `--era dalvik|art` pins the interpretation on read and write, and
+  `--allow-ambiguous-odex` proceeds with an explicit warning. Non-ambiguous odex opcodes
+  remain verbatim-safe. `info --scan` reports the counts without converting.
 * **Legacy ≠ odex.** The m-prefixed instructions in dex 009/013 are the standard
   *legacy* set of their era, not odex — the library's `LegacyRewriter` converts them to
   the modern format, and the CLI applies it automatically before any write. Verified

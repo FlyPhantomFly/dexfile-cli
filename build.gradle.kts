@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "io.github.flyphantomfly"
-version = "0.2.1"
+version = "0.2.2"
 
 repositories {
     mavenCentral()
@@ -15,6 +15,13 @@ repositories {
 dependencies {
     implementation("io.github.vova7878:DexFile:v1.7.1")
     implementation("io.github.vova7878:Smali:v1.7.1")
+    testImplementation(platform("org.junit:junit-bom:5.10.2"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 java {

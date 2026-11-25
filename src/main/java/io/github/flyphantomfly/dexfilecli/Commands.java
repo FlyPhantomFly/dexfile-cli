@@ -1,6 +1,8 @@
 package io.github.flyphantomfly.dexfilecli;
 
 import com.v7878.dex.DexIO;
+import com.v7878.dex.Opcodes;
+import com.v7878.dex.Opcode;
 import com.v7878.dex.DexVersion;
 import com.v7878.dex.ReadOptions;
 import com.v7878.dex.ReferenceType;
@@ -32,7 +34,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -56,11 +60,12 @@ final class Commands {
     // ── reading: flat dex, dex 041 container, or magic-scanned wrapper ────
 
     record ReadResult(DexIO.DexReaderCache cache, Dex dex, DexVersion version,
-                      String detected, int headerOffset, int api) {
+                      String detected, int headerOffset, int api, String era) {
     }
 
-    private static ReadOptions readOptions(DexVersion version, Integer apiOverride) {
+    private static ReadOptions readOptions(DexVersion version, Integer apiOverride, String era) {
         int api = apiOverride != null ? apiOverride : version.getMinApi();
+        boolean art = era != null ? era.equals("art") : api > 20;
         // odex instructions are always enabled: the runtime accepts every opcode it
         // supports regardless of the dex version carrying it (vova7878's guidance),
         // and the art flag must follow the api — defaultOptions() carries art=true
@@ -68,7 +73,7 @@ final class Commands {
         // (FIRST_ART_TARGET) and dalvik up to api 20 (LAST_DALVIK_TARGET) —
         // levels 19 and 20 shipped both runtimes; we read them as dalvik-era.
         return ReadOptions.defaultOptions().withTargetApi(api)
-                .withTargetForArt(api > 20)
+                .withTargetForArt(art)
                 .withOdexInstructions(true)
                 .withExpandedInstructions(api >= 14 && api <= 15);
     }
@@ -77,9 +82,9 @@ final class Commands {
      * Read-API ladder: odex/hiddenapi interpretation depends on targetApi, and
      * minApi alone can be too low (e.g. a standard 035 dex carrying ART markers
      * refuses targetApi=1). Try modern interpretations first; the first that
-     * reads wins.
+     * reads wins. With --era, only that runtime family is tried.
      */
-    private static int[] apiLadder(DexVersion version, Integer apiOverride) {
+    private static int[] apiLadder(DexVersion version, Integer apiOverride, String era) {
         if (apiOverride != null) {
             return new int[]{apiOverride};
         }
@@ -94,9 +99,13 @@ final class Commands {
         int[] ladder = {34, 28, 21, 19, min};
         List<Integer> out = new ArrayList<>();
         for (int api : ladder) {
-            if (api >= min && !out.contains(api)) {
-                out.add(api);
+            if (api < min || out.contains(api)) {
+                continue;
             }
+            if (era != null && (era.equals("dalvik") ? api > 20 : api < 21)) {
+                continue; // --era pins the runtime family
+            }
+            out.add(api);
         }
         int[] arr = new int[out.size()];
         for (int i = 0; i < arr.length; i++) {
@@ -113,12 +122,12 @@ final class Commands {
      * quickened odex opcodes). Null = interpretation doesn't work.
      */
     private static ReadResult tryRead(byte[] data, DexVersion version, int dataOffset,
-                                      int contentOffset, int api, boolean deep) {
+                                      int contentOffset, int api, String era, boolean deep) {
         DexIO.DexReaderCache cache;
         try {
             // embedded dexes are read by slicing the buffer at the magic (data_offset)
             // — DexReader rejects a non-zero header_offset for anything but containers
-            cache = DexIO.readCache(readOptions(version, api), data, dataOffset, 0, contentOffset);
+            cache = DexIO.readCache(readOptions(version, api, era), data, dataOffset, 0, contentOffset);
         } catch (RuntimeException ignored) {
             return null;
         }
@@ -134,25 +143,26 @@ final class Commands {
         }
         String how = (dataOffset == 0 ? "flat" : "wrapped@" + Integer.toHexString(dataOffset))
                 + (contentOffset != 0 ? "/content@" + Integer.toHexString(contentOffset) : "");
-        return new ReadResult(cache, cacheToDex(cache), version, how, dataOffset, api);
+        return new ReadResult(cache, cacheToDex(cache), version, how, dataOffset, api, era);
     }
 
-    private static ReadResult readAny(byte[] data, Integer apiOverride, boolean deep) {
+    private static ReadResult readAny(byte[] data, Integer apiOverride, String era, boolean deep) {
         DexVersion atZero = versionAt(data, 0);
         if (atZero != null && atZero.isDexContainer()) {
-            Dex[] parts = DexIO.readDexContainer(readOptions(atZero, apiOverride), data, 0);
-            return new ReadResult(null, null, atZero, "container(" + parts.length + ")", 0, atZero.getMinApi());
+            Dex[] parts = DexIO.readDexContainer(readOptions(atZero, apiOverride, era), data, 0);
+            int usedApi = apiOverride != null ? apiOverride : atZero.getMinApi();
+            return new ReadResult(null, null, atZero, "container(" + parts.length + ")", 0, usedApi, era);
         }
         if (atZero != null) {
-            for (int api : apiLadder(atZero, apiOverride)) {
-                ReadResult rr = tryRead(data, atZero, 0, 0, api, deep);
+            for (int api : apiLadder(atZero, apiOverride, era)) {
+                ReadResult rr = tryRead(data, atZero, 0, 0, api, era, deep);
                 if (rr != null) {
                     return rr;
                 }
             }
             throw new DexIO.NotADexFile(
                     "flat " + atZero.name() + " magic found but no API interpretation reads it (tried " +
-                            java.util.Arrays.toString(apiLadder(atZero, apiOverride)) + ")");
+                            java.util.Arrays.toString(apiLadder(atZero, apiOverride, era)) + ")");
         }
         // magic scan: packer-shuffled dex, cdex inside vdex, any wrapped form
         List<Integer> candidates = new ArrayList<>();
@@ -167,9 +177,9 @@ final class Commands {
             if (found.size() < 8) {
                 found.add(v.name() + "@" + Integer.toHexString(off));
             }
-            for (int api : apiLadder(v, apiOverride)) {
+            for (int api : apiLadder(v, apiOverride, era)) {
                 for (int contentOffset : new int[]{0, off}) {
-                    ReadResult rr = tryRead(data, v, off, contentOffset, api, deep);
+                    ReadResult rr = tryRead(data, v, off, contentOffset, api, era, deep);
                     if (rr != null) {
                         return rr;
                     }
@@ -229,18 +239,42 @@ final class Commands {
         return writeOptions(target, null);
     }
 
+    record WriteOpts(WriteOptions opts, int api, boolean art) {
+    }
+
     private static WriteOptions writeOptions(DexVersion target, Integer apiOverride) {
+        return writeOptionsEx(target, apiOverride, null).opts();
+    }
+
+    /**
+     * Write options with the era pinned: --era dalvik caps the effective api at
+     * 20 (art=false), --era art floors it at 21 (art=true) — matching the read
+     * ladder's family filter. Without --era the api/art follow the target
+     * version (or the explicit --api override).
+     */
+    private static WriteOpts writeOptionsEx(DexVersion target, Integer apiOverride, String era) {
         int api = apiOverride != null ? apiOverride : target.getMinApi();
-        // DexOptions derives art = api > LAST_DALVIK_TARGET (20), but withers
-        // keep the CURRENT art flag — set it explicitly to stay consistent.
+        boolean art;
+        if (era != null) {
+            art = era.equals("art");
+            if (art && api < 21) {
+                api = 21;       // --era art floors the api at 21
+            }
+            if (!art && api > 20) {
+                api = 20;       // --era dalvik caps the api at 20
+            }
+        } else {
+            art = api > 20;
+        }
         // odex instructions are written verbatim: the runtime accepts them in any
         // dex version it supports (23 <= api <= 30 covers the quickened set).
-        return WriteOptions.defaultOptions()
+        WriteOptions opts = WriteOptions.defaultOptions()
                 .withDexVersion(target)
                 .withTargetApi(api)
-                .withTargetForArt(api > 20)
+                .withTargetForArt(art)
                 .withOdexInstructions(true)
                 .withExpandedInstructions(api >= 14 && api <= 15);
+        return new WriteOpts(opts, api, art);
     }
 
     private static byte[] readFile(String path) {
@@ -275,37 +309,252 @@ final class Commands {
         return new LegacyRewriter().rewriteDex(dex);
     }
 
-    /** Odex (runtime-quickened) instruction count — reported when written verbatim. */
-    private static int countOdexInstructions(Dex dex) {
-        int count = 0;
-        for (ClassDef cls : dex.getClasses()) {
-            for (MethodDef m : cls.getMethods()) {
-                MethodImplementation impl = m.getImplementation();
-                if (impl == null) {
+    // ── ambiguous odex opcode detection (CLI-side; no upstream changes) ───
+    //
+    // Within ONE option set a byte has exactly one claimant; ambiguity is
+    // ACROSS option sets: the same byte decodes as different instructions
+    // depending on the reader's api / art-vs-dalvik era, and the file carries
+    // no runtime-era info, so our interpretation guess decides the meaning.
+    // Example: 0xed is THROW_VERIFICATION_ERROR (dalvik, api >= 5) and
+    // IPUT_CHAR_QUICK (api 23-30) — same size, unrelated semantics.
+
+    private static final Map<DexVersion, Map<Integer, List<String>>> AMBIGUOUS_BYTES = new ConcurrentHashMap<>();
+    private static final Map<DexVersion, Map<String, List<Integer>>> CLAIMANT_BYTES = new ConcurrentHashMap<>();
+
+    private static void buildAmbiguity(DexVersion version) {
+        AMBIGUOUS_BYTES.computeIfAbsent(version, v -> {
+            Map<Integer, Set<String>> union = new TreeMap<>();
+            for (int api = 1; api <= 36; api++) {
+                for (boolean art : new boolean[]{false, true}) {
+                    for (boolean expanded : new boolean[]{false, true}) {
+                        Opcodes table;
+                        try {
+                            ReadOptions opts = ReadOptions.defaultOptions().withTargetApi(api)
+                                    .withTargetForArt(art).withOdexInstructions(true)
+                                    .withExpandedInstructions(expanded);
+                            opts.validate();
+                            v.checkApi(api);
+                            table = Opcodes.of(v, opts);
+                        } catch (RuntimeException e) {
+                            continue; // combination invalid for this version
+                        }
+                        for (int value = 0; value <= 0xFF; value++) {
+                            try {
+                                Opcode op = table.getOpcodeByValue(value);
+                                union.computeIfAbsent(value, k -> new TreeSet<>()).add(op.name());
+                            } catch (RuntimeException e) {
+                                // value has no active claimant under this option set
+                            }
+                        }
+                    }
+                }
+            }
+            union.values().removeIf(names -> names.size() <= 1);
+            Map<Integer, List<String>> bytes = new TreeMap<>();
+            Map<String, List<Integer>> byName = new TreeMap<>();
+            for (var e : union.entrySet()) {
+                bytes.put(e.getKey(), List.copyOf(e.getValue()));
+                for (String name : e.getValue()) {
+                    byName.computeIfAbsent(name, k -> new ArrayList<>()).add(e.getKey());
+                }
+            }
+            CLAIMANT_BYTES.put(v, Map.copyOf(byName));
+            return Map.copyOf(bytes);
+        });
+    }
+
+    /** The ambiguous byte set for a version (built once, cached). */
+    static Set<Integer> ambiguousBytes(DexVersion version) {
+        buildAmbiguity(version);
+        return AMBIGUOUS_BYTES.get(version).keySet();
+    }
+
+    /** True when this opcode's byte has other claimants under other option sets. */
+    private static boolean isAmbiguous(Opcode op, DexVersion version) {
+        buildAmbiguity(version);
+        return CLAIMANT_BYTES.get(version).containsKey(op.name());
+    }
+
+    /** The opcodes that claim the same byte as this one, under other option sets. */
+    private static List<String> alternativeClaimants(Opcode op, DexVersion version) {
+        buildAmbiguity(version);
+        List<String> out = new ArrayList<>();
+        for (int b : CLAIMANT_BYTES.get(version).getOrDefault(op.name(), List.of())) {
+            for (String name : AMBIGUOUS_BYTES.get(version).get(b)) {
+                if (!name.equals(op.name()) && !out.contains(name)) {
+                    out.add(name);
+                }
+            }
+        }
+        return out;
+    }
+
+    private static boolean readArtOf(int readApi, String era) {
+        return era != null ? era.equals("art") : readApi > 20;
+    }
+
+    record OdexScan(int odexInstructions, int ambiguousOdexInstructions,
+                    List<Integer> ambiguousBytes, List<String> ambiguousOps,
+                    List<String> alternatives, int readApi, boolean readArt) {
+        Map<String, Object> toJson() {
+            Map<String, Object> m = Json.obj("odex_instructions", odexInstructions,
+                    "ambiguous_odex_instructions", ambiguousOdexInstructions,
+                    "read_api", readApi, "read_art", readArt);
+            if (!ambiguousBytes.isEmpty()) {
+                m.put("ambiguous_bytes", ambiguousBytes.stream()
+                        .map(b -> String.format("0x%02x", b)).toList());
+            }
+            return m;
+        }
+    }
+
+    /** Walks every instruction of the model and classifies odex/ambiguity. */
+    private static OdexScan scanModel(Dex dex, DexVersion version, int readApi, String era) {
+        boolean readArt = era != null ? era.equals("art") : readApi > 20;
+        buildAmbiguity(version);
+        Opcodes readTable = Opcodes.of(version, readOptions(version, readApi, era));
+        int odex = 0, amb = 0;
+        Set<Integer> bytes = new TreeSet<>();
+        Set<String> ops = new TreeSet<>();
+        Set<String> alts = new TreeSet<>();
+        for (ClassDef c : dex.getClasses()) {
+            for (MethodDef m : c.getMethods()) {
+                if (m.getImplementation() == null) {
                     continue;
                 }
-                for (Instruction ins : impl.getInstructions()) {
-                    if (ins.getOpcode().odexOnly()) {
-                        count++;
+                for (Instruction ins : m.getImplementation().getInstructions()) {
+                    Opcode op = ins.getOpcode();
+                    if (op.odexOnly()) {
+                        odex++;
+                    }
+                    int value;
+                    try {
+                        value = readTable.getOpcodeValue(op);
+                    } catch (RuntimeException e) {
+                        continue; // not claimable under the read table
+                    }
+                    if (AMBIGUOUS_BYTES.get(version).containsKey(value)) {
+                        amb++;
+                        bytes.add(value);
+                        ops.add(op.name());
+                        alts.addAll(alternativeClaimants(op, version));
                     }
                 }
             }
         }
-        return count;
+        return new OdexScan(odex, amb, List.copyOf(bytes), List.copyOf(ops),
+                List.copyOf(alts), readApi, readArt);
+    }
+
+    private static String hex(byte... values) {
+        StringBuilder sb = new StringBuilder();
+        for (int v : values) {
+            sb.append(sb.isEmpty() ? "" : ", ").append(String.format("0x%02x", v));
+        }
+        return sb.toString();
+    }
+
+    private static OdexScan aggregateScans(List<OdexScan> scans, int readApi, boolean readArt) {
+        int odex = 0, amb = 0;
+        Set<Integer> bytes = new TreeSet<>();
+        Set<String> ops = new TreeSet<>();
+        Set<String> alts = new TreeSet<>();
+        for (OdexScan s : scans) {
+            odex += s.odexInstructions();
+            amb += s.ambiguousOdexInstructions();
+            bytes.addAll(s.ambiguousBytes());
+            ops.addAll(s.ambiguousOps());
+            alts.addAll(s.alternatives());
+        }
+        return new OdexScan(odex, amb, List.copyOf(bytes), List.copyOf(ops),
+                List.copyOf(alts), readApi, readArt);
+    }
+
+    /** Adds the scan keys/note/warning to a result entry; only gains keys. */
+    private static void attachScan(Map<String, Object> entry, OdexScan scan, boolean overridden) {
+        if (scan.odexInstructions() > 0) {
+            entry.put("odex_instructions", scan.odexInstructions());
+        }
+        if (scan.ambiguousOdexInstructions() > 0) {
+            entry.putAll(scan.toJson());
+            if (overridden) {
+                entry.put("warning", ambiguousNote(scan.readApi(), scan.readArt(),
+                        String.join(", ", scan.ambiguousOps()), hexBytes(scan.ambiguousBytes())));
+            }
+        } else if (scan.odexInstructions() > 0) {
+            entry.put("note", ODEX_NOTE);
+        }
+    }
+
+    static final class AmbiguousOdexException extends RuntimeException {
+        AmbiguousOdexException(String message) {
+            super(message);
+        }
+    }
+
+    private static String hexBytes(List<Integer> bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (int b : bytes) {
+            sb.append(sb.isEmpty() ? "" : ", ").append(String.format("0x%02x", b));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Safe-by-default write guard: a model read under one interpretation
+     * (api/art) must not be re-encoded under a different one when it carries
+     * era-ambiguous odex instructions — the same bytes decode as different
+     * instructions per era, so the write would silently change their meaning.
+     * Same interpretation => allowed (the count is reported in the JSON);
+     * --allow-ambiguous-odex proceeds with an explicit warning.
+     */
+    private static boolean guardAmbiguousWrite(OdexScan scan, WriteOpts wo,
+                                               boolean allowAmbiguous, String command) {
+        if (scan == null || scan.ambiguousOdexInstructions() == 0) {
+            return false;
+        }
+        // strict: ANY api or art difference from the read interpretation can flip
+        // an ambiguous byte's meaning (the claimants' api windows differ), so the
+        // write is refused unless the interpretation matches exactly
+        if (wo.api() == scan.readApi() && wo.art() == scan.readArt()) {
+            return false; // same interpretation — meaning preserved
+        }
+        String msg = "ambiguous odex instructions in " + command + ": "
+                + scan.ambiguousOdexInstructions() + " instruction(s) decode as ["
+                + String.join(", ", scan.ambiguousOps()) + "] at byte(s) "
+                + hexBytes(scan.ambiguousBytes())
+                + " under the read interpretation (api " + scan.readApi() + ", "
+                + (scan.readArt() ? "art" : "dalvik") + "); writing under api " + wo.api()
+                + ", " + (wo.art() ? "art" : "dalvik") + " would change their meaning "
+                + "(the same bytes also decode as: "
+                + String.join(", ", scan.alternatives()) + "). Pin --era to match the "
+                + "file's runtime era, or pass --allow-ambiguous-odex to proceed anyway";
+        if (allowAmbiguous) {
+            return true; // caller attaches the warning to its JSON
+        }
+        throw new AmbiguousOdexException(msg);
+    }
+
+    private static String ambiguousNote(int readApi, boolean readArt, String ops, String bytes) {
+        return "era-ambiguous odex opcodes present (" + ops + " at byte" + (bytes.contains(",") ? "s" : "")
+                + " " + bytes + "): the same bytes decode as different instructions under "
+                + "dalvik- vs art-era interpretations; this file was read at api " + readApi
+                + " (" + (readArt ? "art" : "dalvik") + ") — writing under a different api/era "
+                + "changes their meaning silently; pin --era or pass --allow-ambiguous-odex";
     }
 
     private static final String ODEX_NOTE =
-            "odex opcodes are written verbatim — the on-device runtime accepts them, "
-                    + "but analysis tools may not resolve quickened references "
-                    + "(the DexFile dev branch ships a smali printer that handles "
-                    + "odex/legacy/expanded opcodes)";
+            "non-ambiguous odex opcodes are written verbatim — the on-device runtime "
+                    + "accepts them; analysis tools may not resolve quickened references "
+                    + "(DexFile's own smali printer handles odex/legacy/expanded opcodes)";
 
     /**
      * Write a full dex, mapping the remaining constraint failure to an honest
      * error: with odex instructions enabled and legacy instructions rewritten,
      * this only fires for genuinely incompatible target choices.
      */
-    private static void writeDex(String path, WriteOptions opts, Dex dex) {
+    private static void writeDex(String path, WriteOptions opts, Dex dex, DexVersion version,
+                                 List<String> ambiguousOps, List<Integer> ambiguousBytes) {
         byte[] out;
         try {
             out = DexIO.write(opts, dex);
@@ -314,10 +563,19 @@ final class Commands {
             if (msg.contains("Constraints for opcode")) {
                 String op = msg.substring(msg.indexOf("opcode ") + 7);
                 op = op.substring(0, op.contains(" ") ? op.indexOf(' ') : op.length());
+                // if the failing opcode is era-ambiguous, the model may have been
+                // decoded under the wrong runtime era — say so explicitly
+                String extra = "";
+                if (ambiguousOps.contains(op)) {
+                    extra = " This opcode's byte (" + hexBytes(new ArrayList<>(ambiguousBytes))
+                            + ") is era-ambiguous — the model may have been decoded under the "
+                            + "wrong runtime era; pin --era to the file's runtime or use a "
+                            + "matching --to.";
+                }
                 throw new DexIO.InvalidDexFile("cannot write opcode " + op + " into the chosen "
                         + "target — era-specific instructions pin the targetApi range, so try "
                         + "another --to (e.g. dalvik-era odex like invoke-direct-empty needs "
-                        + "--to 035; the write target uses the version's own minimum api)");
+                        + "--to 035; the write target uses the version's own minimum api)." + extra);
             }
             throw e;
         }
@@ -341,21 +599,38 @@ final class Commands {
 
     // ── info ──────────────────────────────────────────────────────────────
 
-    static Map<String, Object> info(String file, Integer apiOverride, boolean listClasses, int limit) {
+    static Map<String, Object> info(String file, Integer apiOverride, boolean listClasses, int limit,
+                                    String era, boolean scan) {
         byte[] data = readFile(file);
         DexVersion atZero = versionAt(data, 0);
         if (atZero != null && atZero.isDexContainer()) {
-            Dex[] parts = DexIO.readDexContainer(readOptions(atZero, apiOverride), data, 0);
+            Dex[] parts = DexIO.readDexContainer(readOptions(atZero, apiOverride, era), data, 0);
             List<Object> infos = new ArrayList<>();
+            int readApi = apiOverride != null ? apiOverride : atZero.getMinApi();
+            List<OdexScan> scans = new ArrayList<>();
             for (int i = 0; i < parts.length; i++) {
-                infos.add(dexInfo(parts[i], atZero, "flat", "part" + i));
+                Map<String, Object> part = dexInfo(parts[i], atZero, "flat", "part" + i);
+                if (scan) {
+                    OdexScan s = scanModel(parts[i], atZero, readApi, era);
+                    scans.add(s);
+                    part.putAll(s.toJson());
+                }
+                infos.add(part);
             }
-            return Json.obj("file", file, "container", true, "version", atZero.name(),
+            Map<String, Object> out = Json.obj("file", file, "container", true, "version", atZero.name(),
                     "parts", infos, "part_count", parts.length);
+            if (scan) {
+                boolean art = readArtOf(readApi, era);
+                out.putAll(aggregateScans(scans, readApi, art).toJson());
+            }
+            return out;
         }
-        ReadResult rr = readAny(data, apiOverride, listClasses);
+        ReadResult rr = readAny(data, apiOverride, era, listClasses || scan);
         Map<String, Object> out = dexInfo(rr);
         out.put("file", file);
+        if (scan) {
+            attachScan(out, scanModel(rr.dex, rr.version, rr.api, era), false);
+        }
         if (listClasses) {
             List<String> names = new ArrayList<>();
             for (ClassDef cls : rr.cache.getClasses()) {
@@ -405,7 +680,7 @@ final class Commands {
 
     // ── extract ───────────────────────────────────────────────────────────
 
-    static Map<String, Object> extract(String input, String outDir, Integer apiOverride) {
+    static Map<String, Object> extract(String input, String outDir, Integer apiOverride, String era) {
         byte[] data = readFile(input);
         String dir = outDir != null ? outDir : defaultOut(input, "_dex_extract");
         List<Object> dexes = new ArrayList<>();
@@ -419,7 +694,7 @@ final class Commands {
                         continue;
                     }
                     byte[] dexBytes = zip.getInputStream(entry).readAllBytes();
-                    dexes.addAll(extractDexBlob(dexBytes, entry.getName(), dir, apiOverride));
+                    dexes.addAll(extractDexBlob(dexBytes, entry.getName(), dir, apiOverride, era));
                 }
             } catch (IOException e) {
                 throw new UsageException("cannot read zip '" + input + "': " + e.getMessage());
@@ -428,7 +703,7 @@ final class Commands {
                 throw new DexIO.NotADexFile("no classes*.dex entries inside '" + input + "'");
             }
         } else {
-            dexes.addAll(extractDexBlob(data, Path.of(input).getFileName().toString(), dir, apiOverride));
+            dexes.addAll(extractDexBlob(data, Path.of(input).getFileName().toString(), dir, apiOverride, era));
         }
         return Json.obj("input", input, "out_dir", dir, "dex_files", dexes, "dex_count", dexes.size());
     }
@@ -440,11 +715,11 @@ final class Commands {
         return tmp;
     }
 
-    private static List<Object> extractDexBlob(byte[] data, String label, String dir, Integer apiOverride) {
+    private static List<Object> extractDexBlob(byte[] data, String label, String dir, Integer apiOverride, String era) {
         List<Object> out = new ArrayList<>();
         DexVersion v = versionAt(data, 0);
         if (v != null && v.isDexContainer()) {
-            Dex[] parts = DexIO.readDexContainer(readOptions(v, apiOverride), data, 0);
+            Dex[] parts = DexIO.readDexContainer(readOptions(v, apiOverride, era), data, 0);
             for (int i = 0; i < parts.length; i++) {
                 String name = label + ".part" + i + ".dex";
                 String path = Path.of(dir, name).toString();
@@ -460,7 +735,7 @@ final class Commands {
         Map<String, Object> info;
         try {
             // shallow read: extract only needs the section counts for its report
-            ReadResult rr = readAny(data, apiOverride, false);
+            ReadResult rr = readAny(data, apiOverride, era, false);
             info = Json.obj("version", rr.version.name(), "classes", rr.cache.getClasses().size());
         } catch (RuntimeException e) {
             info = Json.obj("version", "unreadable", "error", String.valueOf(e.getMessage()));
@@ -492,32 +767,42 @@ final class Commands {
         }
     }
 
-    static Map<String, Object> convert(String input, String toVersion, String outPath, Integer apiOverride) {
+    static Map<String, Object> convert(String input, String toVersion, String outPath, Integer apiOverride, String era,
+                                       boolean allowAmbiguous) {
         byte[] data = readFile(input);
         DexVersion target = parseVersion(toVersion);
         List<Object> converted = new ArrayList<>();
         DexVersion atZero = versionAt(data, 0);
+        WriteOpts wo = writeOptionsEx(target, apiOverride, era);
         if (atZero != null && atZero.isDexContainer()) {
-            Dex[] parts = DexIO.readDexContainer(readOptions(atZero, apiOverride), data, 0);
+            Dex[] parts = DexIO.readDexContainer(readOptions(atZero, apiOverride, era), data, 0);
+            int readApi = apiOverride != null ? apiOverride : atZero.getMinApi();
+            List<OdexScan> scans = new ArrayList<>();
+            for (Dex part : parts) {
+                scans.add(scanModel(part, atZero, readApi, era));
+            }
+            boolean overridden = guardAmbiguousWrite(
+                    aggregateScans(scans, readApi, readArtOf(readApi, era)), wo, allowAmbiguous, "convert");
             for (int i = 0; i < parts.length; i++) {
                 String path = (outPath != null && parts.length == 1)
                         ? outPath
                         : (outPath != null ? stripDex(outPath) + ".part" + i + ".dex" : defaultOut(input, ".part" + i + "." + shortVer(target) + ".dex"));
-                writeFile(path, DexIO.write(writeOptions(target, apiOverride), parts[i]));
-                converted.add(Json.obj("path", path, "from", atZero.name(), "to", target.name(),
-                        "classes", parts[i].getClasses().size()));
+                writeFile(path, DexIO.write(wo.opts(), parts[i]));
+                Map<String, Object> entry = Json.obj("path", path, "from", atZero.name(), "to", target.name(),
+                        "classes", parts[i].getClasses().size());
+                attachScan(entry, scans.get(i), overridden);
+                converted.add(entry);
             }
         } else {
-            ReadResult rr = readAny(data, apiOverride, true);
+            ReadResult rr = readAny(data, apiOverride, era, true);
             String path = outPath != null ? outPath : defaultOut(input, "." + shortVer(target) + ".dex");
-            writeDex(path, writeOptions(target, apiOverride), toModernIfNeeded(rr.version, rr.dex));
-            int odex = countOdexInstructions(rr.dex);
+            OdexScan scan = scanModel(rr.dex, rr.version, rr.api, era);
+            boolean overridden = guardAmbiguousWrite(scan, wo, allowAmbiguous, "convert");
+            writeDex(path, wo.opts(), toModernIfNeeded(rr.version, rr.dex), rr.version,
+                    scan.ambiguousOps(), scan.ambiguousBytes());
             Map<String, Object> entry = Json.obj("path", path, "from", rr.version.name(), "to", target.name(),
                     "classes", rr.cache.getClasses().size(), "detected", rr.detected);
-            if (odex > 0) {
-                entry.put("odex_instructions", odex);
-                entry.put("note", ODEX_NOTE);
-            }
+            attachScan(entry, scan, overridden);
             converted.add(entry);
         }
         return Json.obj("input", input, "target_version", target.name(), "converted", converted);
@@ -534,17 +819,19 @@ final class Commands {
 
     // ── assemble ──────────────────────────────────────────────────────────
 
-    static Map<String, Object> assemble(String smaliPath, String outPath, Integer apiOverride) {
+    static Map<String, Object> assemble(String smaliPath, String outPath, Integer apiOverride,
+                                        String era) {
         String smali;
         try {
             smali = Files.readString(Path.of(smaliPath), StandardCharsets.UTF_8);
         } catch (IOException e) {
             throw new UsageException("cannot read '" + smaliPath + "': " + e.getMessage());
         }
-        return assembleText(smali, outPath, smaliPath, apiOverride);
+        return assembleText(smali, outPath, smaliPath, apiOverride, era);
     }
 
-    static Map<String, Object> assembleText(String smali, String outPath, String label, Integer apiOverride) {
+    static Map<String, Object> assembleText(String smali, String outPath, String label, Integer apiOverride,
+                                            String era) {
         ClassDef cls;
         try {
             cls = SmaliIO.parseClass(smali);
@@ -556,7 +843,7 @@ final class Commands {
             target = DexVersion.forApi(apiOverride);
         }
         String path = outPath != null ? outPath : defaultOut(label, ".dex");
-        writeFile(path, DexIO.write(writeOptions(target, apiOverride), Dex.of(cls)));
+        writeFile(path, DexIO.write(writeOptionsEx(target, apiOverride, era).opts(), Dex.of(cls)));
         return Json.obj(
                 "out", path,
                 "class", cls.getType().getName(),
@@ -567,9 +854,9 @@ final class Commands {
 
     // ── outline ───────────────────────────────────────────────────────────
 
-    static Map<String, Object> outline(String input, String className, Integer apiOverride) {
+    static Map<String, Object> outline(String input, String className, Integer apiOverride, String era) {
         byte[] data = readFile(input);
-        ReadResult rr = readAny(data, apiOverride, true);
+        ReadResult rr = readAny(data, apiOverride, era, true);
         requireSingleDex(rr, "outline");
         for (ClassDef cls : rr.cache.getClasses()) {
             if (cls.getType().getName().equals(className)) {
@@ -611,13 +898,16 @@ final class Commands {
 
     // ── split ─────────────────────────────────────────────────────────────
 
-    static Map<String, Object> split(String input, String outDir, Integer apiOverride) {
+    static Map<String, Object> split(String input, String outDir, Integer apiOverride, String era,
+                                     boolean allowAmbiguous) {
         byte[] data = readFile(input);
-        ReadResult rr = readAny(data, apiOverride, true);
+        ReadResult rr = readAny(data, apiOverride, era, true);
         requireSingleDex(rr, "split");
         String dir = outDir != null ? outDir : defaultOut(input, "_split");
-        WriteOptions opts = writeOptions(parseVersion("035"), apiOverride);
-        List<Dex> parts = DexIO.balanceAll(opts,
+        WriteOpts wo = writeOptionsEx(parseVersion("035"), apiOverride, era);
+        OdexScan scan = scanModel(rr.dex, rr.version, rr.api, era);
+        boolean overridden = guardAmbiguousWrite(scan, wo, allowAmbiguous, "split");
+        List<Dex> parts = DexIO.balanceAll(wo.opts(),
                 toModernIfNeeded(rr.version, rr.dex).getClasses());
         String stem = Path.of(input).getFileName().toString();
         if (stem.endsWith(".dex")) {
@@ -626,19 +916,22 @@ final class Commands {
         List<Object> written = new ArrayList<>();
         for (int i = 0; i < parts.size(); i++) {
             String path = Path.of(dir, stem + ".part" + i + ".dex").toString();
-            writeDex(path, opts, parts.get(i));
+            writeDex(path, wo.opts(), parts.get(i), rr.version,
+                    scan.ambiguousOps(), scan.ambiguousBytes());
             written.add(Json.obj("path", path, "classes", parts.get(i).getClasses().size()));
         }
-        return Json.obj("input", input, "out_dir", dir, "total_classes", rr.cache.getClasses().size(),
+        Map<String, Object> out = Json.obj("input", input, "out_dir", dir, "total_classes", rr.cache.getClasses().size(),
                 "parts", written, "part_count", parts.size(),
                 "note", "DexBalancer decides the shard count (64K-reference limit); --parts is advisory only");
+        attachScan(out, scan, overridden);
+        return out;
     }
 
     // ── validate ──────────────────────────────────────────────────────────
 
-    static Map<String, Object> validate(String input, Integer apiOverride, Integer maxIssues) {
+    static Map<String, Object> validate(String input, Integer apiOverride, Integer maxIssues, String era) {
         byte[] data = readFile(input);
-        ReadResult rr = readAny(data, apiOverride, true);
+        ReadResult rr = readAny(data, apiOverride, era, true);
         requireSingleDex(rr, "validate");
         Dex dex = toModernIfNeeded(rr.version, rr.dex);
 
@@ -795,7 +1088,7 @@ final class Commands {
 
         boolean truncated = issueTotal > issues.size();
         boolean ok = issueTotal == 0;
-        return Json.obj(
+        Map<String, Object> out = Json.obj(
                 "file", input,
                 "version", rr.version.name(),
                 "classes_checked", classesChecked,
@@ -814,12 +1107,15 @@ final class Commands {
                         + "(framework classes) are counted as unknown, not flagged; "
                         + "diagnostics from DexFile's ClassPath/analysis package — the "
                         + "dex-level analog of smali_diagnostics");
+        attachScan(out, scanModel(rr.dex, rr.version, rr.api, era), false);
+        return out;
     }
 
     // ── merge ─────────────────────────────────────────────────────────────
 
     static Map<String, Object> merge(List<String> inputs, String outPath,
-                                     Integer apiOverride, boolean allowCdex) {
+                                     Integer apiOverride, String era, boolean allowAmbiguous,
+                                     boolean allowCdex) {
         if (inputs.size() < 2) {
             throw new UsageException("merge needs at least two dex files");
         }
@@ -835,15 +1131,16 @@ final class Commands {
         } else {
             target = DexVersion.forApi(apiOverride != null ? apiOverride : 21);
         }
-        WriteOptions opts = writeOptions(target, apiOverride);
+        WriteOpts wo = writeOptionsEx(target, apiOverride, era);
 
         List<ClassDef> classes = new ArrayList<>();
         Map<TypeId, String> owner = new LinkedHashMap<>();
         List<Object> perInput = new ArrayList<>();
         Set<String> versions = new java.util.TreeSet<>();
+        List<OdexScan> scans = new ArrayList<>();
         for (String input : inputs) {
             byte[] data = readFile(input);
-            ReadResult rr = readAny(data, apiOverride, true);
+            ReadResult rr = readAny(data, apiOverride, era, true);
             requireSingleDex(rr, "merge");
             versions.add(rr.version.name());
             int added = 0;
@@ -856,13 +1153,21 @@ final class Commands {
                 classes.add(cls);
                 added++;
             }
+            scans.add(scanModel(rr.dex, rr.version, rr.api, era));
             perInput.add(Json.obj("file", input, "version", rr.version.name(),
                     "classes", added));
+            // per-input scan keys ride inside each per_input entry
+            Map<String, Object> last = (Map<String, Object>) perInput.get(perInput.size() - 1);
+            attachScan(last, scans.get(scans.size() - 1), false);
         }
+        OdexScan agg = aggregateScans(scans, scans.isEmpty() ? 0 : scans.get(0).readApi(),
+                scans.isEmpty() ? false : scans.get(0).readArt());
+        boolean overridden = guardAmbiguousWrite(agg, wo, allowAmbiguous, "merge");
 
         String path = outPath != null ? outPath : defaultOut(inputs.get(0), ".merged.dex");
         try {
-            writeDex(path, opts, Dex.of(classes));
+            writeDex(path, wo.opts(), Dex.of(classes), target,
+                    agg.ambiguousOps(), agg.ambiguousBytes());
         } catch (IllegalStateException e) {
             String message = String.valueOf(e.getMessage());
             if (message.contains("should not exceed limit")) {
@@ -873,7 +1178,7 @@ final class Commands {
         }
         boolean cdexOut = target.isCompact();
         boolean containerOut = target.isDexContainer();
-        return Json.obj(
+        Map<String, Object> out = Json.obj(
                 "inputs", inputs,
                 "out", path,
                 "target_version", target.name(),
@@ -882,16 +1187,28 @@ final class Commands {
                 "source_versions", versions,
                 "cdex_written", cdexOut,
                 "container_written", containerOut,
+                "odex_instructions", agg.odexInstructions(),
                 "note", cdexOut
                         ? "cdex output is a standalone/analysis artifact — not PathClassLoader-loadable on-device"
                         : containerOut
                         ? "merged into a single-component DEX041 container; each component still observes the 64K section limits"
                         : "merged into a single dex; if a section exceeds 64K the write fails with the limit named — split first");
+        if (agg.ambiguousOdexInstructions() > 0) {
+            out.put("ambiguous_odex_instructions", agg.ambiguousOdexInstructions());
+            out.put("ambiguous_bytes", agg.ambiguousBytes().stream()
+                    .map(b -> String.format("0x%02x", b)).toList());
+            if (overridden) {
+                out.put("warning", ambiguousNote(agg.readApi(), agg.readArt(),
+                        String.join(", ", agg.ambiguousOps()), hexBytes(agg.ambiguousBytes())));
+            }
+        }
+        return out;
     }
 
     // ── patch ─────────────────────────────────────────────────────────────
 
-    static Map<String, Object> patch(String input, String opsPath, String outPath, Integer apiOverride) {
+    static Map<String, Object> patch(String input, String opsPath, String outPath, Integer apiOverride, String era,
+                                     boolean allowAmbiguous) {
         byte[] data = readFile(input);
         String opsJson;
         try {
@@ -923,7 +1240,7 @@ final class Commands {
             throw new UsageException("ops list is empty");
         }
 
-        ReadResult rr = readAny(data, apiOverride, true);
+        ReadResult rr = readAny(data, apiOverride, era, true);
         requireSingleDex(rr, "patch");
         OpRewriter rewriter = new OpRewriter(ops);
         Dex patched = rewriter.rewriteDex(toModernIfNeeded(rr.version, rr.dex));
@@ -933,11 +1250,15 @@ final class Commands {
         // (introduced in API 24, covering the cdex era with room to spare)
         // rather than dropping to 035.
         DexVersion target = original.isCompact() ? DexVersion.DEX037 : original;
-        WriteOptions opts = writeOptions(target, apiOverride);
+        WriteOpts wo = writeOptionsEx(target, apiOverride, era);
         String path = outPath != null ? outPath : input; // .bak is the Python side's job
-        writeDex(path, opts, patched);
+        // the guard compares the READ interpretation against the write options —
+        // the scanned model is what was read, before the ops touched it
+        OdexScan scan = scanModel(rr.dex, rr.version, rr.api, era);
+        boolean overridden = guardAmbiguousWrite(scan, wo, allowAmbiguous, "patch");
+        writeDex(path, wo.opts(), patched, rr.version,
+                scan.ambiguousOps(), scan.ambiguousBytes());
 
-        int odex = countOdexInstructions(patched);
         List<Object> opResults = new ArrayList<>();
         for (Map<String, Object> op : ops) {
             String type = String.valueOf(op.get("op"));
@@ -948,12 +1269,9 @@ final class Commands {
                 "out", path,
                 "version_from", original.name(),
                 "version_to", target.name(),
-                "odex_instructions", odex,
                 "ops", opResults,
                 "note", "matched=0 means the op found nothing — check class/method names");
-        if (odex > 0) {
-            out.put("odex_note", ODEX_NOTE);
-        }
+        attachScan(out, scan, overridden);
         return out;
     }
 
