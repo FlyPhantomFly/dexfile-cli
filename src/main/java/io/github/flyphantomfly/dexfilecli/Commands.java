@@ -503,14 +503,14 @@ final class Commands {
                 String path = (outPath != null && parts.length == 1)
                         ? outPath
                         : (outPath != null ? stripDex(outPath) + ".part" + i + ".dex" : defaultOut(input, ".part" + i + "." + shortVer(target) + ".dex"));
-                writeFile(path, DexIO.write(writeOptions(target), parts[i]));
+                writeFile(path, DexIO.write(writeOptions(target, apiOverride), parts[i]));
                 converted.add(Json.obj("path", path, "from", atZero.name(), "to", target.name(),
                         "classes", parts[i].getClasses().size()));
             }
         } else {
             ReadResult rr = readAny(data, apiOverride, true);
             String path = outPath != null ? outPath : defaultOut(input, "." + shortVer(target) + ".dex");
-            writeDex(path, writeOptions(target), toModernIfNeeded(rr.version, rr.dex));
+            writeDex(path, writeOptions(target, apiOverride), toModernIfNeeded(rr.version, rr.dex));
             int odex = countOdexInstructions(rr.dex);
             Map<String, Object> entry = Json.obj("path", path, "from", rr.version.name(), "to", target.name(),
                     "classes", rr.cache.getClasses().size(), "detected", rr.detected);
